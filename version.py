@@ -2,7 +2,7 @@
 import json
 import urllib.request
 
-VERSION = "1.6.4"
+VERSION = "1.6.5"
 GAME_TITLE = "БАЛАНС СИЛ"
 # Строка авторства: внизу главного меню и на экране выбора фракции.
 CREDIT = "Goodfly256 + ZCode (GLM 5.3 Flash)"
@@ -10,9 +10,15 @@ CREDIT = "Goodfly256 + ZCode (GLM 5.3 Flash)"
 # Откуда брать информацию об обновлениях. Ожидается JSON вида:
 # {"version": "1.4.0", "url": "https://...", "notes": "что нового"}
 # Пока репозитория нет — проверка честно сообщит «не удалось».
-UPDATE_URL = "https://raw.githubusercontent.com/Goodfly256/balance-of-power/main/version.json"
+UPDATE_URL = "https://raw.githubusercontent.com/Goodfly256-2/balance-of-power/master/version.json"
 
 CHANGELOG = [
+    ("1.6.5", "2026-10-25", [
+        "Фронтовые числа доведены до идеала: всегда горизонтальные, стоят на "
+        "территории своей страны с отступом от границы; изгиб вдоль фронта "
+        "только для длинных плавных горизонтальных участков; строгая защита "
+        "от любых перекрытий",
+    ]),
     ("1.6.4", "2026-10-25", [
         "Игровая музыка: настоящая напевная мелодия поверх прогрессии "
         "Dm–Bb–F–C (ведущая линия с вибрато), без гула",

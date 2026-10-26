@@ -2617,8 +2617,10 @@ def draw_map(screen, game, fonts):
             pygame.draw.polygon(screen, (255, 180, 60), region_poly(r.x, r.y), 2)
 
     # ---- проход 8: численность войск вдоль крупных фронтов ----
-    # гарнизон приграничья (2 клетки) каждой стороны, текст изгибается вдоль
-    # линии фронта; у страны с двумя врагами — два независимых числа
+    # гарнизон приграничья (2 клетки) каждой стороны; у страны с двумя врагами
+    # — по числу на каждого. Идеал читаемости: число горизонтально, стоит на
+    # «своём» участке границы и отступлено вглубь своей территории; изгиб
+    # вдоль пути — только для длинных плавных горизонтальных фронтов
     labels = []
     for fr in game.fronts():
         fid_a, fid_b = fr["pair"]
@@ -2629,34 +2631,71 @@ def draw_map(screen, game, fonts):
             continue
         labels.append((va + vb, front_troops_text(va), front_troops_text(vb), fr))
     placed = []
+    map_rect = R(MAP_X + 4, MAP_Y + 4, MAP_W - 8, MAP_H - 8)
     for _, ta, tb, fr in sorted(labels, key=lambda t: -t[0]):
         pts = fr["path"]
-        if len(pts) < 2:
+        if len(pts) < 2 or fr["pos"] is None:
             continue
         p0, p1 = pts[0], pts[-1]
         vx, vy = p1[0] - p0[0], p1[1] - p0[1]
         pa = fr["pos"].get(fr["pair"][0])
         cross = vx * (pa[0] - p0[0]) - vy * (pa[1] - p0[1]) if pa else 0.0
         side_a = 1 if cross > 0 else -1
-        ok_a = _text_along_path(screen, f_front, ta, pts, 30, side=side_a,
-                                anchor="start", placed_rects=placed)
-        ok_b = _text_along_path(screen, f_front, tb, pts, 30, side=-side_a,
-                                anchor="end", placed_rects=placed)
-        if not (ok_a and ok_b):
-            # фронт короткий или сильно изогнут: прямые подписи у центров сторон
-            for fid, txt in ((fr["pair"][0], ta), (fr["pair"][1], tb)):
-                pp = fr["pos"].get(fid)
-                if pp is None:
-                    continue
-                img = render_outline(f_front, txt)
-                rect = pygame.Rect(int(MAP_X + pp[0] * TILE - img.get_width() / 2),
-                                   int(MAP_Y + pp[1] * TILE - img.get_height() / 2),
+        scr = [(MAP_X + (p[0] + 0.5) * TILE, MAP_Y + (p[1] + 0.5) * TILE)
+               for p in pts]
+        plen = sum(math.hypot(scr[i + 1][0] - scr[i][0], scr[i + 1][1] - scr[i][1])
+                   for i in range(len(scr) - 1))
+        horizontal = abs(vx) >= abs(vy) * 1.4
+        enough = plen > (len(ta) + len(tb)) * 17
+        if horizontal and enough:
+            ok_a = _text_along_path(screen, f_front, ta, pts, 30, side=side_a,
+                                    anchor="start", placed_rects=placed)
+            ok_b = _text_along_path(screen, f_front, tb, pts, 30, side=-side_a,
+                                    anchor="end", placed_rects=placed)
+            if ok_a and ok_b:
+                continue
+        # горизонтальные числа: точка пути на «своём» участке, отступ вглубь
+        for fid, txt in ((fr["pair"][0], ta), (fr["pair"][1], tb)):
+            pp = fr["pos"].get(fid)
+            if pp is None:
+                continue
+            cs = (MAP_X + (pp[0] + 0.5) * TILE, MAP_Y + (pp[1] + 0.5) * TILE)
+            img = render_outline(f_front, txt)
+            my_side = side_a if fid == fr["pair"][0] else -side_a
+            # точки пути со стороны этой страны
+            own = []
+            for i in range(1, len(scr)):
+                a_, b_ = scr[i - 1], scr[i]
+                c2 = (b_[0] - a_[0]) * (cs[1] - a_[1]) - (b_[1] - a_[1]) * (cs[0] - a_[0])
+                own.append((i, c2 * my_side >= 0))
+            idxs = [i for i, is_own in own if is_own] or list(range(1, len(scr)))
+            # кандидаты: середина, четверти, края — ближайшие к центру своего участка
+            mid = idxs[len(idxs) // 2]
+            order = [mid] + sorted(set(idxs) - {mid},
+                                   key=lambda i: abs(i - mid))[:len(idxs)]
+            best = None
+            for i in order:
+                p = scr[min(i, len(scr) - 1)]
+                dx, dy = cs[0] - p[0], cs[1] - p[1]
+                d = math.hypot(dx, dy) or 1.0
+                bx = p[0] + dx / d * 0.52 * TILE
+                by = p[1] + dy / d * 0.52 * TILE
+                rect = pygame.Rect(int(bx - img.get_width() / 2),
+                                   int(by - img.get_height() / 2),
                                    img.get_width(), img.get_height())
-                rect.clamp_ip(R(MAP_X + 2, MAP_Y + 2, MAP_W - 4, MAP_H - 4))
-                if any(rect.inflate(6, 6).colliderect(r) for r in placed):
+                rect.clamp_ip(map_rect)
+                if not any(rect.inflate(10, 10).colliderect(r) for r in placed):
+                    best = rect
+                    break
+            if best is None:
+                best = pygame.Rect(int(cs[0] - img.get_width() / 2),
+                                   int(cs[1] - img.get_height() / 2),
+                                   img.get_width(), img.get_height())
+                best.clamp_ip(map_rect)
+                if any(best.inflate(10, 10).colliderect(r) for r in placed):
                     continue
-                placed.append(rect)
-                screen.blit(img, rect.topleft)
+            placed.append(best.inflate(6, 6))
+            screen.blit(img, best.topleft)
 
     # ---- движущиеся армии ----
     if game.moves:
