@@ -1,4 +1,4 @@
-# «Баланс сил: Стратегия» — игра на pygame.
+# «Balance of Power» — игра на pygame.
 # - карты от 6×6 до 10×10 с органичными «живыми» границами, реальное время с паузой;
 # - 4 фракции + независимый центр; можно играть за любую или в режиме наблюдателя;
 # - экономика: казна (налоги), людские ресурсы, содержание армии, развитие регионов;
@@ -2389,7 +2389,7 @@ def draw_topbar(screen, game, fonts):
     f_title, f_head, f_body, f_small, f_tiny, f_num, f_front, f_chip = fonts
     pygame.draw.rect(screen, (23, 26, 32), (0, 0, W, TOPBAR_H))
     pygame.draw.line(screen, BORDER, (0, TOPBAR_H), (W, TOPBAR_H), 1)
-    screen.blit(f_head.render("БАЛАНС СИЛ", True, TEXT), (16, 6))
+    screen.blit(f_head.render(version.GAME_TITLE, True, TEXT), (16, 6))
     sc = SCENARIOS.get(getattr(game, "scenario", "classic"))
     sub = f"сценарий «{sc['name']}»" if sc else "стратегия"
     screen.blit(f_tiny.render(sub, True, MUTED), (16, 28))
@@ -2618,16 +2618,18 @@ def draw_map(screen, game, fonts):
 
     # ---- проход 8: численность войск вдоль крупных фронтов ----
     # гарнизон приграничья (2 клетки) каждой стороны; у страны с двумя врагами
-    # — по числу на каждого. Идеал читаемости: число горизонтально, стоит на
-    # «своём» участке границы и отступлено вглубь своей территории; изгиб
-    # вдоль пути — только для длинных плавных горизонтальных фронтов
+    # — по числу на каждого. Числа ТОЛЬКО у пар стран, которые воюют между
+    # собой: мирные границы и стычки чужих армий в проходе чисел не получают.
+    # Идеал читаемости: число горизонтально, стоит на «своём» участке границы
+    # и отступлено вглубь своей территории; изгиб вдоль пути — только для
+    # длинных плавных горизонтальных фронтов
     labels = []
     for fr in game.fronts():
         fid_a, fid_b = fr["pair"]
         va, vb = fr["troops"][fid_a], fr["troops"][fid_b]
         if (va < 1 and vb < 1) or va + vb < 4000:
             continue
-        if not (fr["contested"] or game.at_war(fid_a, fid_b)):
+        if not game.at_war(fid_a, fid_b):
             continue
         labels.append((va + vb, front_troops_text(va), front_troops_text(vb), fr))
     placed = []
@@ -4093,7 +4095,7 @@ def run_game(scenario="classic", opts=None, screen=None, caption=None):
     opts = dict(opts or {})
     if screen is None:
         screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
-    pygame.display.set_caption(caption or f"Баланс сил: Стратегия — {SCENARIOS.get(scenario, SCENARIOS['classic'])['name']}")
+    pygame.display.set_caption(caption or f"Balance of Power — {SCENARIOS.get(scenario, SCENARIOS['classic'])['name']}")
 
     game = Game(scenario, opts)
     fonts = make_fonts()

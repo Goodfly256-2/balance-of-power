@@ -1,8 +1,8 @@
 # СТАРЫЙ ПРОТОТИП — НЕ РАЗВИВАЕТСЯ.
 # Это ранний тест сражения за одну провинцию. Актуальная игра — strategy.py
-# («Баланс сил: Стратегия», карта 8×8). Файл оставлен только для истории.
+# («Balance of Power», карта 8×8). Файл оставлен только для истории.
 #
-# Интерфейс боя «Баланс сил» на pygame.
+# Интерфейс боя «Balance of Power» на pygame.
 # - поддержка 3 команд (защитник в центре, два атакующих по краям);
 # - регион — полоса, разбитая на отрезки-владения (owners); фронт — их граница;
 #   владения рисуются «живой» картой: органичные границы, текстура, тонкие линии;
@@ -1002,7 +1002,7 @@ def draw(screen, sim, paused, speed, selected, observer=False):
     font_sm = pygame.font.SysFont("segoeui", 17, bold=True)
     font_num = pygame.font.SysFont("segoeui", 38, bold=True)
 
-    draw_label(screen, font_t, "БАЛАНС СИЛ — БИТВА ЗА РЕГИОН", 30, 22, (255, 255, 255))
+    draw_label(screen, font_t, "BALANCE OF POWER — БИТВА ЗА РЕГИОН", 30, 22, (255, 255, 255))
     if observer:
         draw_label(screen, font_sm, "РЕЖИМ НАБЛЮДАТЕЛЯ", 520, 26, (255, 220, 120))
     pygame.draw.rect(screen, (60, 64, 72), (5, 64, W - 10, 3))
@@ -1052,7 +1052,7 @@ def draw(screen, sim, paused, speed, selected, observer=False):
 def main():
     pygame.init()
     screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Баланс сил — Битва за регион")
+    pygame.display.set_caption("Balance of Power — Битва за регион")
     clock = pygame.time.Clock()
 
     sim = BattleSim()

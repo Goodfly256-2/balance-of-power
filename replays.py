@@ -2,12 +2,14 @@
 #
 # Реплей = урезанная история партии: снимки карты раз в секунду (владельцы,
 # силы, столицы) + метаданные (сценарий, страны, дата, победитель).
-# Хранятся в replays/*.json рядом с кодом. Папка grows ~1 МБ на партию.
+# Хранятся в replays/ рядом с кодом (или с exe). Папка grows ~1 МБ на партию.
 import json
 import os
 import time
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
+import _appdir
+
+_DIR = _appdir.app_dir()
 REPLAY_DIR = os.path.join(_DIR, "replays")
 
 

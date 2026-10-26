@@ -2,8 +2,8 @@
 import json
 import urllib.request
 
-VERSION = "1.6.5"
-GAME_TITLE = "БАЛАНС СИЛ"
+VERSION = "1.7.0"
+GAME_TITLE = "BALANCE OF POWER"
 # Строка авторства: внизу главного меню и на экране выбора фракции.
 CREDIT = "Goodfly256 + ZCode (GLM 5.3 Flash)"
 
@@ -13,6 +13,14 @@ CREDIT = "Goodfly256 + ZCode (GLM 5.3 Flash)"
 UPDATE_URL = "https://raw.githubusercontent.com/Goodfly256-2/balance-of-power/master/version.json"
 
 CHANGELOG = [
+    ("1.7.0", "2026-10-26", [
+        "Название игры теперь только на английском: Balance of Power",
+        "Фронтовые числа — только у воюющих стран: мирные границы и стычки "
+        "чужих армий в проходе больше не подписываются",
+        "Донат в главном меню: USDT / USDC / POL в сети Polygon, копирование "
+        "адреса в один клик",
+        "Установщик Windows (Inno Setup) и сборка релизов через GitHub Actions",
+    ]),
     ("1.6.5", "2026-10-25", [
         "Фронтовые числа доведены до идеала: всегда горизонтальные, стоят на "
         "территории своей страны с отступом от границы; изгиб вдоль фронта "

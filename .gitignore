@@ -20,3 +20,13 @@ assets/*.wav
 assets/loading/
 replays/*.json
 settings.json
+
+# Сборка установщика
+build/
+dist/
+Output/
+
+# Локальные черновики и справочные файлы
+.zcode/
+_splice.py
+Пример.png

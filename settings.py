@@ -1,8 +1,10 @@
-# Настройки игры: хранятся в settings.json рядом с кодом.
+# Настройки игры: хранятся в settings.json рядом с кодом (или с exe).
 import json
 import os
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
+import _appdir
+
+_DIR = _appdir.app_dir()
 PATH = os.path.join(_DIR, "settings.json")
 
 DEFAULTS = {

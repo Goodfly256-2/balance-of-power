@@ -1,4 +1,5 @@
-# Главное меню «Баланс сил»: вкладки «Играть», «Что новенького?», «Настройки».
+# Главное меню «Balance of Power»: вкладки «Играть», «Что новенького?»,
+# «Повторы», «Настройки».
 # - Играть: выбор сценария (карта и страны) и запуск strategy.run_game;
 # - Что новенького?: список изменений из version.CHANGELOG и авто-проверка
 #   обновлений (version.check_updates);
@@ -30,6 +31,13 @@ ACCENT = (74, 144, 217)
 GOOD = (96, 210, 140)
 WARN = (235, 190, 90)
 BAD = (226, 96, 80)
+
+# ---- Донаты: сеть Polygon, USDT / USDC / POL ----
+# Один адрес EVM на все три токена. Замените DONATE_ADDRESS на свой.
+DONATE_ADDRESS = "0xa247dd17104ee5fae4b7576cf82872a4071b03ae"
+DONATE_CHAIN = "Polygon"
+DONATE_TOKENS = ("USDT", "USDC", "POL")
+POLYGON_SCAN = "https://polygonscan.com/address/" + DONATE_ADDRESS
 
 
 def mix(c1, c2, t):
@@ -102,7 +110,7 @@ def draw_background(screen, t):
 
 # ---------------- раскладка ----------------
 def tab_rects():
-    labels = ["Играть", "Что новенького?", "Повторы", "Настройки"]
+    labels = ["Играть", "Что новенького?", "Повторы", "Настройки", "Поддержать"]
     w, gap = 220, 10
     x0 = W // 2 - (len(labels) * w + (len(labels) - 1) * gap) // 2
     return [R(x0 + i * (w + gap), 120, w, 44) for i in range(len(labels))], labels
@@ -183,8 +191,10 @@ class Menu:
             self.draw_news()
         elif self.tab == 2:
             self.draw_replays_tab()
-        else:
+        elif self.tab == 3:
             self.draw_settings()
+        else:
+            self.draw_donate()
 
         # строка авторства
         credit = f_small.render(version.CREDIT, True, MUTED)
@@ -294,6 +304,51 @@ class Menu:
             pygame.draw.rect(screen, (70, 78, 92),
                              (card.right - 10, bar_y, 5, bar_h), border_radius=3)
 
+    def draw_donate(self):
+        """Вкладка «Поддержать»: адрес Polygon для USDT / USDC / POL."""
+        f_title, f_head, f_body, f_small, f_chip, f_sc = self.fonts
+        screen = self.screen
+        card = R((W - 760) // 2, 176, 760, 380)
+        draw_card(screen, card, PANEL, BORDER, 12)
+        y = card.y + 18
+        screen.blit(f_head.render("Поддержать разработку", True, TEXT), (card.x + 20, y))
+        y += 34
+        for line in ("Если игра понравилась — можно отправить донат в криптовалюте.",
+                     "Сеть: Polygon. Принимаем USDT, USDC и POL на один адрес."):
+            screen.blit(f_body.render(line, True, MUTED), (card.x + 20, y))
+            y += 24
+        y += 12
+
+        # адрес: моноширинный, кнопка «КОПИРОВАТЬ»
+        screen.blit(f_head.render("Адрес (Polygon):", True, TEXT), (card.x + 20, y))
+        y += 30
+        addr_rect = R(card.x + 20, y, card.w - 40, 44)
+        draw_card(screen, addr_rect, (18, 20, 26), BORDER, 8, 1)
+        f_mono = pygame.font.SysFont("consolas", 20, bold=True)
+        shown = clip_text(f_mono, DONATE_ADDRESS, addr_rect.w - 24)
+        img = f_mono.render(shown, True, (240, 244, 250))
+        screen.blit(img, (addr_rect.x + 12,
+                          addr_rect.centery - img.get_height() // 2))
+        self._addr_rect = addr_rect
+
+        btn = R(card.right - 170, card.y + card.h - 66, 150, 40)
+        copied = getattr(self, "_copied_until", 0) > self.time
+        draw_button(screen, f_chip, btn,
+                    "СКОПИРОВАНО!" if copied else "КОПИРОВАТЬ",
+                    (70, 140, 90) if not copied else (55, 110, 75))
+        self._copy_btn = btn
+
+        y2 = card.y + card.h - 58
+        screen.blit(f_small.render(
+            "Проверить адрес: polygonscan.com", True, MUTED), (card.x + 20, y2 + 10))
+        self._scan_btn = R(card.x + 20, y2, 240, 34)
+        draw_button(screen, f_small, self._scan_btn, "ОТКРЫТЬ POLYGONSCAN",
+                    (70, 100, 130))
+        # подсказка о токенах справа от кнопки
+        tok = " · ".join(DONATE_TOKENS) + f"  ·  {DONATE_CHAIN}"
+        screen.blit(f_small.render(tok, True, MUTED),
+                    (self._scan_btn.right + 14, y2 + 10))
+
     def draw_settings(self):
         f_title, f_head, f_body, f_small, f_chip, f_sc = self.fonts
         screen = self.screen
@@ -354,7 +409,7 @@ class Menu:
             "on_exit": self._back_to_menu,
             "show_names": self.settings.get("show_names", True),
             "show_numbers": self.settings.get("show_numbers", False),
-        }, screen=win, caption="Баланс сил")
+        }, screen=win, caption="Balance of Power")
         audio.set_volume(self.settings["music_volume"])
         audio.play_menu()
 
@@ -419,6 +474,32 @@ class Menu:
                 self.update_status = "checking"
                 threading.Thread(target=self._check_updates, daemon=True).start()
                 return True
+            return False
+
+        if self.tab == 4:
+            # донат: клик по адресу или кнопке — копировать; по кнопке — скан
+            import pygame.scrap
+            btn = getattr(self, "_copy_btn", None)
+            addr = getattr(self, "_addr_rect", None)
+            if btn and btn.collidepoint(pos) or (addr and addr.collidepoint(pos)):
+                try:
+                    pygame.scrap.init()
+                    pygame.scrap.put_text(DONATE_ADDRESS)
+                except Exception:
+                    try:
+                        import subprocess
+                        subprocess.run(["clip"], input=DONATE_ADDRESS.encode("utf-16-le"),
+                                       check=False)
+                    except Exception:
+                        pass
+                self._copied_until = self.time + 2.0
+                return True
+            scan = getattr(self, "_scan_btn", None)
+            if scan and scan.collidepoint(pos):
+                import webbrowser
+                webbrowser.open(POLYGON_SCAN)
+                return True
+            return False
         return False
 
     def drag(self, pos):
@@ -539,14 +620,14 @@ class ReplayViewer:
             strategy.draw(self.buf, self.game, self.fonts)
             strategy.blit_scaled(self.screen, self.buf, self.screen.get_size())
             pygame.display.flip()
-        pygame.display.set_caption(f"Баланс сил — v{version.VERSION}")
+        pygame.display.set_caption(f"Balance of Power — v{version.VERSION}")
 
 
 def main():
     os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
     pygame.init()
     screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
-    pygame.display.set_caption(f"Баланс сил — v{version.VERSION}")
+    pygame.display.set_caption(f"Balance of Power — v{version.VERSION}")
     loading.show(screen, min_time=2.2)          # заставка со случайным «фото»
     menu = Menu(screen)
     buf = pygame.Surface((W, H))      # виртуальный буфер 1280×760
@@ -567,6 +648,8 @@ def main():
                     menu.tab = 2
                 elif event.key == pygame.K_4:
                     menu.tab = 3
+                elif event.key == pygame.K_5:
+                    menu.tab = 4
                 elif event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_RETURN and menu.tab == 0:

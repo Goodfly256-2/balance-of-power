@@ -10,7 +10,9 @@ import random
 
 import pygame
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
+import _appdir
+
+_DIR = _appdir.app_dir()
 ASSETS = os.path.join(_DIR, "assets")
 LOAD_DIR = os.path.join(ASSETS, "loading")
 

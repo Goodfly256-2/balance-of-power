@@ -1,73 +1,93 @@
-# Баланс сил
+# Balance of Power
 
-Стратегия реального времени на pygame: карты от 6×6 до 10×10, органичные
-«живые» границы, экономика, дипломатия, доктрины и фронты.
+Real-time grand strategy game on pygame: maps from 6×6 to 10×10, organic
+"living" borders, economy, diplomacy, doctrines and front lines.
 
-**Авторство:** Goodfly256 + ZCode (GLM 5.3 Flash)
+**Authorship:** Goodfly256 + ZCode (GLM 5.3 Flash)
 
-## Запуск
+![Gameplay](docs/screenshot_game.png)
 
-Требуется Python 3.10+ и pygame:
+## Download
+
+Grab the latest Windows installer from
+[Releases](https://github.com/Goodfly256-2/balance-of-power/releases) —
+no Python required. Or run from source:
 
 ```bash
 pip install pygame
 python menu.py
 ```
 
-Игра сама сгенерирует музыку и экраны загрузки при первом запуске.
+The game generates its music and loading screens on first launch.
 
-## Возможности
+## Features
 
-- **Сценарии**: Классика, Дуэль гигантов, Шесть держав, Осаждённая твердыня,
-  Раскол, Анархия (8 стран на 10×10).
-- **Доктрины**: Манёвры / Удар / Оборона — треугольник противодействия
-  (Манёвры бьют Удар, Удар ломает Оборону, Оборона перемалывает Манёвры).
-- **Технологии**: Артиллерия, Связь, Мотопехота, Медицина.
-- **Идеологии**: Демократия, Монархия, Фашизм, Коммунизм, Технократия —
-  каждая меняет экономику, армию и поведение; процедурные флаги стран.
-- **Дипломатия**: союзы с обязательным военным долгом (нападение на союзника
-  втягивает его партнёров), пакты, торговля, помощь союзникам (Золото и
-  Люди), предательства ИИ.
-- **Война**: гарнизоны приграничья (2 клетки) с числами вдоль линии фронта,
-  перехват армий на марше, запрет отхода из боя, волна захвата регионов.
-- **Повторы**: автосохранение партий, просмотр из главного меню, график
-  территорий по времени.
-- **Прочее**: главное меню с проверкой обновлений, экраны загрузки с
-  процедурными пейзажами, изменяемое окно и полноэкранный режим (F11),
-  сгенерированная музыка (меню и игра), режим наблюдателя.
+- **Scenarios**: Classic, Giant Duel, Six Powers, Besieged Citadel,
+  The Divide, Anarchy (8 nations on 10×10).
+- **Doctrines**: Maneuver / Strike / Defense — a counter-triangle
+  (Maneuver beats Strike, Strike breaks Defense, Defense grinds Maneuver).
+- **Technology**: Artillery, Communications, Motorized Infantry, Medicine.
+- **Ideologies**: Democracy, Monarchy, Fascism, Communism, Technocracy —
+  each changes economy, army and behavior; procedural nation flags.
+- **Diplomacy**: alliances with mandatory war debt (attacking an ally drags
+  in its partners), pacts, trade, ally aid (Gold and Manpower), AI betrayals.
+- **War**: border-region garrisons (2 tiles) with troop counts along the
+  front line — **front numbers appear only for nations actually at war**,
+  march interception, no-retreat rule, capture wave across regions.
+- **Replays**: auto-save finished games, watch them from the main menu,
+  territory-over-time chart.
+- **Misc**: main menu with update check, loading screens with procedural
+  landscapes, resizable window and fullscreen (F11), generated music
+  (menu and in-game), observer mode.
+- **Support the dev**: built-in donate tab — USDT / USDC / POL on Polygon.
 
-## Управление
+## Controls
 
-| Клавиша | Действие |
-|---------|----------|
-| ЛКМ / ПКМ | выбрать регион / отправить войска |
-| SHIFT + ПКМ | отправить почти все войска |
-| ПРОБЕЛ | пауза |
-| S | скорость ×1 → ×2 → ×4 → ×8 |
-| G | показать все цифры войск |
-| N | названия стран на карте |
-| TAB | вкладки панели (Обзор / Регион / Дипломатия / Войны) |
-| F11 | полноэкранный режим |
-| ESC | в главное меню |
+| Key | Action |
+|-----|--------|
+| LMB / RMB | select region / send troops |
+| SHIFT + RMB | send almost all troops |
+| SPACE | pause |
+| S | speed ×1 → ×2 → ×4 → ×8 |
+| G | show all troop numbers |
+| N | nation names on the map |
+| TAB | panel tabs (Overview / Region / Diplomacy / Wars) |
+| F11 | fullscreen |
+| ESC | back to main menu |
 
-## Структура
+## Project layout
 
-| Файл | Назначение |
-|------|-----------|
-| `menu.py` | главное меню (вкладки, обновления, повторы, настройки) |
-| `strategy.py` | модель и отрисовка партии |
-| `battle_gui.py` | тактический бой |
-| `audio.py` | генерация музыки (без зависимостей) |
-| `loading.py` | экраны загрузки с процедурными пейзажами |
-| `replays.py` | сохранение и загрузка повторов |
-| `version.py` | версия, changelog, проверка обновлений |
-| `_fix_stress.py` | регрессионный тест (`python _fix_stress.py`) |
+| File | Purpose |
+|------|---------|
+| `menu.py` | main menu (tabs, updates, replays, donate, settings) |
+| `strategy.py` | match model and rendering |
+| `battle_gui.py` | tactical battle (legacy) |
+| `audio.py` | music generation (no dependencies) |
+| `loading.py` | loading screens with procedural landscapes |
+| `replays.py` | replay save/load |
+| `version.py` | version, changelog, update check |
+| `_fix_stress.py` | regression test (`python _fix_stress.py`) |
+| `installer.iss` | Inno Setup script for the Windows installer |
+| `.github/workflows/release.yml` | CI build of the installer + GitHub Release |
 
-## Обновления
+## Updates
 
-Игра проверяет `version.json` в этом репозитории. Чтобы выпустить новую
-версию, обновите `VERSION` в `version.py` и положите в корень репозитория:
+The game checks `version.json` in this repository. To ship a new release,
+bump `VERSION` in `version.py`, update `version.json`, tag the commit
+(`git tag v1.7.0 && git push --tags`) — GitHub Actions builds the installer
+and attaches it to the release automatically.
 
-```json
-{"version": "1.7.0", "url": "https://github.com/Goodfly256/balance-of-power", "notes": "что нового"}
+## Donate
+
+If you like the game, you can support development with crypto on
+**Polygon**: USDT, USDC or POL to
+
 ```
+0xa247dd17104ee5fae4b7576cf82872a4071b03ae
+```
+
+(the same address is copyable in-game: main menu → «Поддержать» / Support).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

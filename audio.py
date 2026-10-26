@@ -11,8 +11,10 @@ import struct
 import threading
 import wave
 
+import _appdir
+
 SR = 44100
-_DIR = os.path.dirname(os.path.abspath(__file__))
+_DIR = _appdir.app_dir()
 ASSETS = os.path.join(_DIR, "assets")
 MENU_WAV = os.path.join(ASSETS, "menu_music.wav")
 GAME_WAV = os.path.join(ASSETS, "game_music.wav")
