@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Тестовые артефакты и скриншоты разработчика
+_test_*
+_shot_*
+_fix_stress_*.png
+_game_stdout.log
+
+# Сгенерируемые данные (создаются при первом запуске)
+assets/*.wav
+assets/loading/
+replays/*.json
+settings.json
