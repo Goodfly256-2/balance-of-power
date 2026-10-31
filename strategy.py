@@ -386,7 +386,6 @@ class Region:
         self.capital_of = None
         self.flash = 0.0                # подсветка боя
         self.entry = {}                 # fid -> (dx, dy): откуда пришёл атакующий
-        self.dshare = 0.0               # плавно отображаемая доля захвата
 
     @property
     def income(self):
@@ -775,19 +774,6 @@ class Game:
     def region_divisions(self, r):
         return [d for d in self.divisions if d.reg == r.rid and d.soldiers > 1]
 
-    def control(self, r):
-        """Возвращает (доля владельца, сильнейший чужак, его доля)."""
-        pres = self.region_presence(r)
-        owner_f = pres.get(r.owner, 0.0)
-        foreign = [(v, f) for f, v in pres.items() if f != r.owner and v > 1]
-        if not foreign:
-            return 1.0, None, 0.0
-        foreign.sort(reverse=True)
-        v, f = foreign[0]
-        total = owner_f + v
-        share = v / total if total > 0 else 0.0
-        return max(0.0, 1.0 - share), f, min(1.0, share)
-
     def battle_preview(self, r):
         """Что происходит в регионе: дивизии сторон и их урон в секунду."""
         divs = self.region_divisions(r)
@@ -894,11 +880,6 @@ class Game:
             tiles = set()
             for e in segs:
                 tiles.update(e["tiles"])
-            contested = False
-            for rid in tiles:
-                if len(self._presence.get(rid, {})) > 1:
-                    contested = True
-                    break
 
             # дивизии приграничья: BFS от фронта на border_depth вглубь,
             # солдаты считаются по присутствию дивизий в зоне фронта
@@ -994,7 +975,7 @@ class Game:
                             (segs[0]["mx"] + 0.5, segs[0]["my"])]
 
             out.append({"pair": pair, "mx": mx, "my": my, "troops": troops,
-                        "contested": contested, "angle": angle, "pos": pos,
+                        "angle": angle, "pos": pos,
                         "path": mids})
         return out
 
@@ -2257,30 +2238,6 @@ def draw_counter_rect(screen, font, rect, color, troops, dim=False):
     screen.blit(img, (fx + 13, rect.centery - img.get_height() // 2))
 
 
-def find_spot(rect, placed, bounds):
-    if not any(rect.colliderect(p) for p in placed):
-        return rect
-    step = rect.h + 3
-    for off in range(1, 9):
-        for dy in (step * off, -step * off):
-            for dx in (0, rect.w // 2 + 8, -(rect.w // 2 + 8)):
-                cand = rect.move(dx, dy)
-                cand.clamp_ip(bounds)
-                if not any(cand.colliderect(p) for p in placed):
-                    return cand
-    return rect
-
-
-def draw_clash(screen, x, y):
-    """Вспышка встречного боя."""
-    for ang, col, ln in ((0, (255, 236, 150), 14), (90, (255, 236, 150), 14),
-                         (45, (255, 170, 90), 11), (-45, (255, 170, 90), 11)):
-        rad = math.radians(ang)
-        dx, dy = math.cos(rad) * ln, math.sin(rad) * ln
-        pygame.draw.line(screen, col, (x - dx, y - dy), (x + dx, y + dy), 3)
-    pygame.draw.circle(screen, (255, 250, 220), (int(x), int(y)), 4)
-
-
 def draw_division_chip(screen, f_num, f_tiny, px, py, d, col,
                        selected=False, show_num=False):
     """Чип дивизии в стиле символов НАТО: прямоугольник страны + знак типа.
@@ -2849,50 +2806,15 @@ def draw_map(screen, game, fonts):
     if sel is not None and game.player is not None and game.regions[sel].owner == game.player:
         move_targets = set(neighbor_ids)
 
-    # ---- проход 1: провинции — полупрозрачный цвет страны поверх фона
-    #      с текстурой (как на примере); спорные — слоями в буфер ----
-    contested = []
-    splits = {}
+    # ---- проход 1: провинции — полупрозрачный цвет страны поверх фона ----
     fills = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
     for r in game.regions:
         col = faction_color(game, r.owner)
-        owner_share, inv_fid, inv_share = game.control(r)
-        # плавная и динамичная доля захвата: быстрая сходимость без рывков
-        # (draw ~60 к/с, поэтому коэффициент подобран под кадр)
-        r.dshare += (inv_share - r.dshare) * 0.22
-        if inv_fid is not None and r.dshare > 0.02:
-            contested.append((r, col, inv_fid))
         # координаты полигонов абсолютные — приводим к локальным координатам
         # surface, иначе заливка уезжает относительно линий границ
         pygame.draw.polygon(fills, col + (195,),
                             [(px - MAP_X, py - MAP_Y) for px, py in region_poly(r.x, r.y)])
     screen.blit(fills, (MAP_X, MAP_Y))
-
-    occ = {r.rid: (r.dshare, game.attack_dir(r, inv_fid), inv_fid)
-           for r, col, inv_fid in contested}
-    for r, col, inv_fid in contested:
-        b = region_bbox(r.x, r.y)
-        ox, oy = MAP_X + r.x * TILE, MAP_Y + r.y * TILE
-        frac, d, _ = occ[r.rid]
-        # сглаживаем долю захвата вдоль линии боя — без ступенек между тайлами
-        vals = [frac, frac]
-        for nrid in ((r.rid + GRID, r.rid - GRID) if d in ((1, 0), (-1, 0))
-                     else (r.rid - 1, r.rid + 1)):
-            ninfo = occ.get(nrid)
-            if ninfo is None or ninfo[1] != d or ninfo[2] != inv_fid:
-                continue
-            if nrid in (r.rid - 1, r.rid + 1) and abs(game.regions[nrid].x - r.x) != 1:
-                continue          # не переходим через край строки
-            vals.append(ninfo[0])
-        frac = min(0.97, max(0.03, sum(vals) / len(vals)))
-        pts = split_line(d, frac, r.x, r.y)
-        splits[r.rid] = (pts, d, ox, oy)
-        # полоса оккупанта — полупрозрачный цвет захватчика поверх заливки
-        surf = pygame.Surface((b.w, b.h), pygame.SRCALPHA)
-        band = [(px + ox - b.x, py + oy - b.y) for px, py in band_poly(d, pts)]
-        pygame.draw.polygon(surf, faction_color(game, inv_fid) + (180,), band)
-        surf.blit(region_mask(r.x, r.y), (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-        screen.blit(surf, (b.x, b.y))
 
     # ---- проход 2: тонкие внутренние линии (как на примере) ----
     ls = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
@@ -2923,15 +2845,6 @@ def draw_map(screen, game, fonts):
             if hot:
                 pygame.draw.lines(fx, (255, 190, 120, 60), False, mp, 1)
     screen.blit(fx, (MAP_X, MAP_Y))
-
-    # ---- проход 5: линия боя внутри провинции (спокойная, статичная) ----
-    fxs = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
-    for r, col, inv_fid in contested:
-        pts, d, ox, oy = splits[r.rid]
-        mp = [(ox + px - MAP_X, oy + py - MAP_Y) for px, py in pts]
-        pygame.draw.lines(fxs, (28, 16, 10, 170), False, mp, 3)
-        pygame.draw.lines(fxs, (255, 244, 220, 80), False, mp, 1)
-    screen.blit(fxs, (MAP_X, MAP_Y))
 
     # ---- проход 6: вспышки боя ----
     for r in game.regions:
@@ -2984,6 +2897,28 @@ def draw_map(screen, game, fonts):
             pygame.draw.polygon(screen, mix(col, (255, 255, 255), 0.55),
                                 poly, max(1, int(3 * pulse)))
 
+    # ---- проход 6.8: захват региона дивизиями — растущая полоса цвета
+    #      захватчика по прогрессу cap_prog (новая модель; старой «оккупации
+    #      по соотношению сил» больше нет) ----
+    for r in game.regions:
+        if r.cap_fid is None or r.cap_prog <= 0.015:
+            continue
+        cap_col = faction_color(game, r.cap_fid)
+        d = game.attack_dir(r, r.cap_fid)
+        frac = min(0.96, max(0.04, r.cap_prog))
+        pts = split_line(d, frac, r.x, r.y)
+        b = region_bbox(r.x, r.y)
+        ox, oy = MAP_X + r.x * TILE, MAP_Y + r.y * TILE
+        band = [(px + ox - b.x, py + oy - b.y) for px, py in band_poly(d, pts)]
+        surf = pygame.Surface((b.w, b.h), pygame.SRCALPHA)
+        pygame.draw.polygon(surf, cap_col + (165,), band)
+        # линия раздела прогресса
+        mp = [(ox + px - b.x, oy + py - b.y) for px, py in pts]
+        pygame.draw.lines(surf, (255, 244, 220, 90), False, mp, 1)
+        surf.blit(region_mask(r.x, r.y), (0, 0),
+                  special_flags=pygame.BLEND_RGBA_MULT)
+        screen.blit(surf, (b.x, b.y))
+
     # ---- проход 7: столицы, города, выделение ----
     for r in game.regions:
         x = MAP_X + r.x * TILE
@@ -2993,12 +2928,11 @@ def draw_map(screen, game, fonts):
                       game.factions.get(r.owner))
         if r.city is not None:
             draw_city_icon(screen, x, y, r, game)
-        owner_share, inv_fid, inv_share = game.control(r)
-        if inv_fid is not None and 0.03 < inv_share < 0.985:
-            txt = f"{int(round(inv_share * 100))}%"
+        if r.cap_fid is not None and r.cap_prog > 0.03:
+            txt = f"{int(round(r.cap_prog * 100))}%"
             pc = f_tiny.render(txt, True, (255, 236, 170))
             psh = f_tiny.render(txt, True, (20, 15, 0))
-            d = game.attack_dir(r, inv_fid)
+            d = game.attack_dir(r, r.cap_fid)
             left_side = (d == (1, 0))
             top_side = (d != (0, -1))
             px = x + 4 if left_side else x + TILE - pc.get_width() - 4
@@ -3383,7 +3317,7 @@ def draw_region_tab(screen, game, fonts):
     # бой в регионе: дивизии сторон
     info = game.battle_preview(r)
     if len(info) > 1:
-        screen.blit(f_head.render("Бой за регион", True, (255, 170, 120)),
+        screen.blit(f_head.render("Бой в регионе", True, (255, 170, 120)),
                     (rr.x + 16, rr.y + 100))
         order = sorted(info.items(), key=lambda kv: -kv[1]["troops"])
         bx = rr.x + 150
