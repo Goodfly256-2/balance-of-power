@@ -3,7 +3,7 @@
 
 #define MyAppName "Balance of Power"
 #ifndef MyAppVersion
-#define MyAppVersion "1.7.0"
+#define MyAppVersion "2.0.0"
 #endif
 #define MyAppPublisher "Goodfly256"
 #define MyAppExeName "BalanceOfPower.exe"

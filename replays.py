@@ -21,7 +21,7 @@ def save_replay(game):
         sc = game.scenario
         path = os.path.join(REPLAY_DIR, f"replay_{sc}_{stamp}.json")
         data = {
-            "version": 1,
+            "version": 2,          # v2: в снимках есть дивизии и города
             "saved": time.strftime("%Y-%m-%d %H:%M"),
             "scenario": sc,
             "winner": game.winner,
