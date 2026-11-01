@@ -2283,12 +2283,13 @@ def _cap_wave(key):
 def split_line(d, frac, gx, gy):
     """«Жидкая» граница владелец/оккупант (локальные координаты тайла).
 
-    Позиция границы = прогресс захвата frac ± крупные плавные лопасти.
-    Цвет захватчика перетекает по территории округлыми языками, как жидкость:
-    волна одна на всё направление атаки и зависит только от глобальной
-    координаты ВДОЛЬ границы, поэтому соседние тайлы (даже на ступенчатом
-    фронте) стыкуются идеально; покрытие зажато в [0.05, 0.95] — узкий
-    плацдарм не «схлопывается»."""
+    frac — доля захвата: число ИЛИ функция(u_px) -> доля в этой точке
+    фронта (гладкое поле по всем приграничным провинциям, см. draw_map).
+    Позиция границы = поле захвата ± органичные лопасти (3 октавы, одна
+    волна на всё направление атаки): цвет захватчика перетекает по
+    территории округлыми языками, граница непрерывна вдоль всего фронта
+    и между тайлами; покрытие зажато в [0.05, 0.95] и не дальше ±0.3 от
+    поля — лопасти читаются, но фронт не врёт о положении."""
     if d in ((1, 0), (-1, 0)):
         comps = _cap_wave((0, 1 if d == (1, 0) else -1))
     else:
@@ -2299,12 +2300,13 @@ def split_line(d, frac, gx, gy):
         s = i / (n - 1)
         along = -6 + (TILE + 12) * s
         u = (gy if d in ((1, 0), (-1, 0)) else gx) * TILE + along
+        f0 = frac(u) if callable(frac) else frac
         lobe = sum(a * math.sin(6.283185 * u / (lam * TILE) + p)
                    for a, lam, p in comps)
-        # граница гуляет вокруг реального прогресса не дальше ±0.3 тайла:
+        # граница гуляет вокруг поля захвата не дальше ±0.3 тайла:
         # лопасти читаются, но полоса не врёт о положении фронта
-        cov = min(min(0.95, frac + 0.30), max(max(0.05, frac - 0.30),
-                                              frac + lobe))
+        cov = min(min(0.95, f0 + 0.30), max(max(0.05, f0 - 0.30),
+                                            f0 + lobe))
         if d in ((1, 0), (-1, 0)):
             x = TILE * (1.0 - cov) if d == (1, 0) else TILE * cov
             pts.append((x, along))
@@ -2475,22 +2477,62 @@ def draw_map(screen, game, fonts):
 
     occ = {r.rid: (r.dshare, game.attack_dir(r, inv_fid), inv_fid)
            for r, col, inv_fid in contested}
+
+    # ---- поле захвата вдоль фронтов -------------------------------------
+    # Доля каждого приграничного региона становится точкой на оси фронта
+    # (ось — вдоль линии боя). Гауссово ядро размывает все точки фронта
+    # в гладкое поле: граница захвата — ОДНА кривая на весь фронт, которая
+    # учитывает проценты ВСЕХ приграничных провинций и течёт без ступенек.
+    # Соседние колонки/строки (ступенчатые фронты) подмешиваются слабее.
+    raw_pts = {}
+    for rid, (f0, d, inv) in occ.items():
+        r = game.regions[rid]
+        axis_h = d in ((1, 0), (-1, 0))          # атака с востока/запада
+        fixed = r.x if axis_h else r.y           # колонка/строка фронта
+        center = (r.y if axis_h else r.x) + 0.5  # положение вдоль фронта
+        sign = d[0] if axis_h else d[1]
+        key = (0 if axis_h else 1, fixed, sign, inv)
+        raw_pts.setdefault(key, []).append((center, f0))
+    front_pts = {}
+    for key, pts in raw_pts.items():
+        axis, fixed, sign, inv = key
+        merged = [(c, f, 1.0) for (c, f) in pts]
+        for df in (-1, 1):
+            for (c, f) in raw_pts.get((axis, fixed + df, sign, inv), ()):
+                merged.append((c, f, 0.35))
+        front_pts[key] = merged
+
+    def frac_at(key, u):
+        """Доля захвата в точке u (глобальные пиксели) вдоль фронта."""
+        samples = front_pts.get(key)
+        if not samples:
+            return None
+        sigma = 1.25 * TILE
+        num = den = 0.0
+        near_f, near_d2 = None, None
+        for (c_tile, f, w) in samples:
+            d2 = (u - c_tile * TILE) ** 2
+            wg = w * math.exp(-d2 / (2.0 * sigma * sigma))
+            num += f * wg
+            den += wg
+            if near_d2 is None or d2 < near_d2:
+                near_d2, near_f = d2, f
+        if den < 1e-9:
+            return near_f
+        return num / den
+
     for r, col, inv_fid in contested:
         b = region_bbox(r.x, r.y)
         ox, oy = MAP_X + r.x * TILE, MAP_Y + r.y * TILE
         frac, d, _ = occ[r.rid]
-        # сглаживаем долю захвата вдоль линии боя — без ступенек между тайлами
-        vals = [frac, frac]
-        for nrid in ((r.rid + GRID, r.rid - GRID) if d in ((1, 0), (-1, 0))
-                     else (r.rid - 1, r.rid + 1)):
-            ninfo = occ.get(nrid)
-            if ninfo is None or ninfo[1] != d or ninfo[2] != inv_fid:
-                continue
-            if nrid in (r.rid - 1, r.rid + 1) and abs(game.regions[nrid].x - r.x) != 1:
-                continue          # не переходим через край строки
-            vals.append(ninfo[0])
-        frac = min(0.97, max(0.03, sum(vals) / len(vals)))
-        pts = split_line(d, frac, r.x, r.y)
+        axis_h = d in ((1, 0), (-1, 0))
+        key = (0 if axis_h else 1,
+               r.x if axis_h else r.y,
+               d[0] if axis_h else d[1], inv_fid)
+        def _f(u, k=key, own_v=frac):
+            v = frac_at(k, u)
+            return own_v if v is None else v
+        pts = split_line(d, _f, r.x, r.y)
         splits[r.rid] = (pts, d, ox, oy)
         # полоса оккупанта — полупрозрачный цвет захватчика поверх заливки
         surf = pygame.Surface((b.w, b.h), pygame.SRCALPHA)
