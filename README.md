@@ -22,18 +22,13 @@ The game generates its music and loading screens on first launch.
 
 ## Features
 
-- **Divisions (v2.0)**: armies are 1000-soldier divisions moving freely
-  across the map (not tied to province centers) in 4 types — Infantry,
-  Tanks, Artillery (fires up to 2.6 tiles), Recon. Divisions fight on
-  contact, fire at range and capture territory by presence.
-- **Encirclement**: a division cut off from supply (BFS from the capital)
-  is "in the cauldron" — attrition, combat penalty, red ring on the map.
-- **Cities**: each city runs in ARSENAL mode (build-queue of divisions) or
-  SCIENCE mode (research points); technologies are researched with science
-  points instead of money.
-- **Diplomacy v2**: aggression builds *threat*; frightened neighbors form
-  coalitions against too-dangerous countries; AI sues for peace when
-  bleeding or exhausted.
+- **Regions and fronts**: armies are garrisons inside provinces — recruit,
+  develop, march between regions, intercept enemies on the march and fight
+  for regions; front troop counts along the border — **front numbers appear
+  only for nations actually at war**.
+- **Liquid capture view**: the capture border is an organic "liquid" line
+  with smooth rounded lobes — the attacker's color flows across the
+  territory like ink and seamlessly joins across staircase fronts.
 - **Scenarios**: Classic, Giant Duel, Six Powers, Besieged Citadel,
   The Divide, Anarchy (8 nations on 10×10).
 - **Doctrines**: Maneuver / Strike / Defense — a counter-triangle
@@ -41,9 +36,8 @@ The game generates its music and loading screens on first launch.
 - **Technology**: Artillery, Communications, Motorized Infantry, Medicine.
 - **Ideologies**: Democracy, Monarchy, Fascism, Communism, Technocracy —
   each changes economy, army and behavior; procedural nation flags.
-- **War**: front troop counts along the border — **front numbers appear
-  only for nations actually at war**, capture is paused while defenders
-  hold the region, tracer fire drawn on the map.
+- **Diplomacy**: alliances with mandatory war debt (attacking an ally drags
+  in its partners), pacts, trade, ally aid (Gold and Manpower), AI betrayals.
 - **Replays**: auto-save finished games, watch them from the main menu,
   territory-over-time chart.
 - **Misc**: main menu with update check, loading screens with procedural
@@ -55,13 +49,11 @@ The game generates its music and loading screens on first launch.
 
 | Key | Action |
 |-----|--------|
-| LMB | select all divisions in a region |
-| SHIFT + LMB (on a division) | add/remove one division to selection |
-| A | select all your divisions |
-| RMB | order selected divisions to move to the point |
+| LMB / RMB | select region / send troops |
+| SHIFT + RMB | send almost all troops |
 | SPACE | pause |
 | S | speed ×1 → ×2 → ×4 → ×8 |
-| G | show all division numbers |
+| G | show all troop numbers |
 | N | nation names on the map |
 | TAB | panel tabs (Overview / Region / Diplomacy / Wars) |
 | F11 | fullscreen |
