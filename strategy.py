@@ -2484,18 +2484,18 @@ def draw_map(screen, game, fonts):
         return min(1.0, foe / tot) if tot > 0.5 else 0.0
 
     def draw_band(tile, foe_col, d, cov):
-        """Полоса цвета foe_col в tile со стороны d + линия раздела."""
+        """Мягкая полоса цвета foe_col в tile со стороны d.
+
+        Без обводки: граница — это просто органичный стык двух цветов,
+        как на референсе. Прозрачность растёт с глубиной захвата, у тонкой
+        «линии войны» полоса едва заметна."""
         b = region_bbox(tile.x, tile.y)
         ox, oy = MAP_X + tile.x * TILE, MAP_Y + tile.y * TILE
         pts = split_line(d, cov, tile.x, tile.y)
         surf = pygame.Surface((b.w, b.h), pygame.SRCALPHA)
         band = [(px + ox - b.x, py + oy - b.y) for px, py in band_poly(d, pts)]
-        strong = cov > 0.2
-        pygame.draw.polygon(surf, foe_col + (185 if strong else 150,), band)
-        mp = [(px + ox - b.x, py + oy - b.y) for px, py in pts]
-        pygame.draw.lines(surf, (28, 16, 10, 170 if strong else 110),
-                          False, mp, 3)
-        pygame.draw.lines(surf, (255, 244, 220, 80), False, mp, 1)
+        a = int(80 + 110 * max(0.0, min(1.0, (cov - FLOOR) / 0.40)))
+        pygame.draw.polygon(surf, foe_col + (a,), band)
         surf.blit(region_mask(tile.x, tile.y), (0, 0),
                   special_flags=pygame.BLEND_RGBA_MULT)
         screen.blit(surf, (b.x, b.y))
