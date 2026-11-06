@@ -2623,6 +2623,94 @@ def draw_map(screen, game, fonts):
                 pygame.draw.lines(fx, (255, 190, 120, 60), False, mp, 1)
     screen.blit(fx, (MAP_X, MAP_Y))
 
+    # ---- проход 4.5: окружения (котлы) ---------------------------------
+    # Группа регионов, отрезанная от основной территории своей страны, —
+    # котёл: слегка затемняется и обводится пульсирующим кольцом цвета
+    # окружителя. Прорвавшиеся в тыл войска (бой в провинции, вокруг
+    # которой нет связной земли армии-захватчика) — тоже котёл: фронт
+    # читается целиком, а глубокий клин выглядит как окружение.
+    pockets = []
+    main_body = {}
+    for fid, f in game.factions.items():
+        if not f.alive:
+            continue
+        own = {r.rid for r in f.regions}
+        if not own:
+            continue
+        # связные компоненты земель страны; крупнейшая — основная территория
+        comps = []
+        left = set(own)
+        while left:
+            seed = next(iter(left))
+            grp = {seed}
+            stack = [seed]
+            left.discard(seed)
+            while stack:
+                cur = stack.pop()
+                for nb in game.neighbors(game.regions[cur]):
+                    if nb.owner == fid and nb.rid in left:
+                        left.discard(nb.rid)
+                        grp.add(nb.rid)
+                        stack.append(nb.rid)
+            comps.append(grp)
+        comps.sort(key=len, reverse=True)
+        main_body[fid] = comps[0]
+        for grp in comps[1:]:
+            cnt = {}
+            for rid in grp:
+                for nb in game.neighbors(game.regions[rid]):
+                    if nb.rid not in grp and game.at_war(fid, nb.owner):
+                        cnt[nb.owner] = cnt.get(nb.owner, 0) + 1
+            if cnt:
+                pockets.append((grp, max(cnt, key=cnt.get)))
+    # войска, прорвавшиеся глубже фронта: воюют в провинции, вокруг
+    # которой нет связной земли их стороны — они в котле
+    for r in game.regions:
+        for f2, v in r.forces.items():
+            if v <= 200 or f2 == r.owner or f2 == NEUTRAL:
+                continue
+            if f2 not in game.factions or not game.at_war(f2, r.owner):
+                continue
+            if r.rid in main_body.get(f2, ()):
+                continue
+            if any(nb.rid in main_body.get(f2, ()) for nb in game.neighbors(r)):
+                continue
+            pockets.append(({r.rid}, r.owner))
+
+    for grp, besieger in pockets:
+        col = faction_color(game, besieger)
+        # лёгкое затемнение котла
+        for rid in grp:
+            r = game.regions[rid]
+            m = region_mask(r.x, r.y).copy()
+            m.fill((16, 12, 10, 60), special_flags=pygame.BLEND_RGBA_MULT)
+            b = region_bbox(r.x, r.y)
+            screen.blit(m, (b.x, b.y))
+        # пульсирующее кольцо по внешним рёбрам котла (внутренние границы
+        # между регионами котла не обводятся — кольцо одно, вокруг всего)
+        pulse = 0.55 + 0.45 * math.sin(game.time * 2.6)
+        ring = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
+        for rid in grp:
+            r = game.regions[rid]
+            x, y = r.x, r.y
+            sides = []
+            if y == 0 or game.region_at(x, y - 1).rid not in grp:
+                sides.append(edge_pts('h', x, y))
+            if y == GRID - 1 or game.region_at(x, y + 1).rid not in grp:
+                sides.append(edge_pts('h', x, y + 1))
+            if x == 0 or game.region_at(x - 1, y).rid not in grp:
+                sides.append(edge_pts('v', x, y))
+            if x == GRID - 1 or game.region_at(x + 1, y).rid not in grp:
+                sides.append(edge_pts('v', x + 1, y))
+            for pts in sides:
+                mp = [(px - MAP_X, py - MAP_Y) for px, py in pts]
+                pygame.draw.lines(ring, col + (int(60 * pulse),), False, mp, 7)
+                pygame.draw.lines(ring, col + (int(150 + 80 * pulse),),
+                                  False, mp, 3)
+                pygame.draw.lines(ring, (255, 250, 235, int(55 * pulse)),
+                                  False, mp, 1)
+        screen.blit(ring, (MAP_X, MAP_Y))
+
     # ---- проход 6: вспышки боя ----
     for r in game.regions:
         if r.flash > 0:
