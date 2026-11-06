@@ -2303,9 +2303,10 @@ def split_line(d, frac, gx, gy):
         f0 = frac(u) if callable(frac) else frac
         lobe = sum(a * math.sin(6.283185 * u / (lam * TILE) + p)
                    for a, lam, p in comps)
-        # граница гуляет вокруг поля захвата не дальше ±0.3 тайла:
-        # лопасти читаются, но полоса не врёт о положении фронта
-        cov = min(min(0.95, f0 + 0.30), max(max(0.05, f0 - 0.30),
+        # у тонкой «линии войны» лопасти мягче, у глубокого захвата — во всю
+        # амплитуду; граница гуляет вокруг поля не дальше ±0.3 тайла
+        lobe *= 0.25 + 0.75 * min(1.0, f0 / 0.35)
+        cov = min(min(0.95, f0 + 0.30), max(max(0.04, f0 - 0.30),
                                             f0 + lobe))
         if d in ((1, 0), (-1, 0)):
             x = TILE * (1.0 - cov) if d == (1, 0) else TILE * cov
@@ -2456,90 +2457,141 @@ def draw_map(screen, game, fonts):
     if sel is not None and game.player is not None and game.regions[sel].owner == game.player:
         move_targets = set(neighbor_ids)
 
-    # ---- проход 1: провинции — полупрозрачный цвет страны поверх фона
-    #      с текстурой (как на примере); спорные — слоями в буфер ----
-    contested = []
-    splits = {}
+    # ---- проход 1: провинции — полупрозрачный цвет страны поверх фона ----
     fills = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
     for r in game.regions:
         col = faction_color(game, r.owner)
-        owner_share, inv_fid, inv_share = game.control(r)
-        # «жидкое» перетекание: доля захвата догоняет реальную медленно и
-        # плавно — граница течёт, а не прыгает (draw ~60 к/с)
-        r.dshare += (inv_share - r.dshare) * 0.10
-        if inv_fid is not None and r.dshare > 0.02:
-            contested.append((r, col, inv_fid))
         # координаты полигонов абсолютные — приводим к локальным координатам
         # surface, иначе заливка уезжает относительно линий границ
         pygame.draw.polygon(fills, col + (195,),
                             [(px - MAP_X, py - MAP_Y) for px, py in region_poly(r.x, r.y)])
     screen.blit(fills, (MAP_X, MAP_Y))
 
-    occ = {r.rid: (r.dshare, game.attack_dir(r, inv_fid), inv_fid)
-           for r, col, inv_fid in contested}
+    # ---- «жидкая» граница войны: видна НА ВСЁМ фронте -------------------
+    # Для каждого ребра между воюющими провинциями берём давление (долю
+    # сил противника в провинции), сглаживаем его во времени и гауссовым
+    # ядром вдоль всей линии фронта (соседние линии ступенчатых фронтов
+    # подмешиваются слабее). Полоса противника рисуется С ОБЕИХ СТОРОН
+    # каждого ребра: весь фронт покрыт органичной «жидкой» линией, её
+    # глубина растёт там, где войска реально давят и захватывают.
+    banded = set()
 
-    # ---- поле захвата вдоль фронтов -------------------------------------
-    # Доля каждого приграничного региона становится точкой на оси фронта
-    # (ось — вдоль линии боя). Гауссово ядро размывает все точки фронта
-    # в гладкое поле: граница захвата — ОДНА кривая на весь фронт, которая
-    # учитывает проценты ВСЕХ приграничных провинций и течёт без ступенек.
-    # Соседние колонки/строки (ступенчатые фронты) подмешиваются слабее.
-    raw_pts = {}
-    for rid, (f0, d, inv) in occ.items():
-        r = game.regions[rid]
-        axis_h = d in ((1, 0), (-1, 0))          # атака с востока/запада
-        fixed = r.x if axis_h else r.y           # колонка/строка фронта
-        center = (r.y if axis_h else r.x) + 0.5  # положение вдоль фронта
-        sign = d[0] if axis_h else d[1]
-        key = (0 if axis_h else 1, fixed, sign, inv)
-        raw_pts.setdefault(key, []).append((center, f0))
-    front_pts = {}
-    for key, pts in raw_pts.items():
-        axis, fixed, sign, inv = key
-        merged = [(c, f, 1.0) for (c, f) in pts]
-        for df in (-1, 1):
-            for (c, f) in raw_pts.get((axis, fixed + df, sign, inv), ()):
-                merged.append((c, f, 0.35))
-        front_pts[key] = merged
+    def pair_press(tile, foe_fid):
+        """Доля сил foe_fid в tile против сил владельца (0..1)."""
+        own = tile.forces.get(tile.owner, 0.0)
+        foe = tile.forces.get(foe_fid, 0.0)
+        tot = own + foe
+        return min(1.0, foe / tot) if tot > 0.5 else 0.0
 
-    def frac_at(key, u):
-        """Доля захвата в точке u (глобальные пиксели) вдоль фронта."""
-        samples = front_pts.get(key)
-        if not samples:
-            return None
-        sigma = 1.25 * TILE
-        num = den = 0.0
-        near_f, near_d2 = None, None
-        for (c_tile, f, w) in samples:
-            d2 = (u - c_tile * TILE) ** 2
-            wg = w * math.exp(-d2 / (2.0 * sigma * sigma))
-            num += f * wg
-            den += wg
-            if near_d2 is None or d2 < near_d2:
-                near_d2, near_f = d2, f
-        if den < 1e-9:
-            return near_f
-        return num / den
-
-    for r, col, inv_fid in contested:
-        b = region_bbox(r.x, r.y)
-        ox, oy = MAP_X + r.x * TILE, MAP_Y + r.y * TILE
-        frac, d, _ = occ[r.rid]
-        axis_h = d in ((1, 0), (-1, 0))
-        key = (0 if axis_h else 1,
-               r.x if axis_h else r.y,
-               d[0] if axis_h else d[1], inv_fid)
-        def _f(u, k=key, own_v=frac):
-            v = frac_at(k, u)
-            return own_v if v is None else v
-        pts = split_line(d, _f, r.x, r.y)
-        splits[r.rid] = (pts, d, ox, oy)
-        # полоса оккупанта — полупрозрачный цвет захватчика поверх заливки
+    def draw_band(tile, foe_col, d, cov):
+        """Полоса цвета foe_col в tile со стороны d + линия раздела."""
+        b = region_bbox(tile.x, tile.y)
+        ox, oy = MAP_X + tile.x * TILE, MAP_Y + tile.y * TILE
+        pts = split_line(d, cov, tile.x, tile.y)
         surf = pygame.Surface((b.w, b.h), pygame.SRCALPHA)
         band = [(px + ox - b.x, py + oy - b.y) for px, py in band_poly(d, pts)]
-        pygame.draw.polygon(surf, faction_color(game, inv_fid) + (180,), band)
-        surf.blit(region_mask(r.x, r.y), (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        strong = cov > 0.2
+        pygame.draw.polygon(surf, foe_col + (185 if strong else 150,), band)
+        mp = [(px + ox - b.x, py + oy - b.y) for px, py in pts]
+        pygame.draw.lines(surf, (28, 16, 10, 170 if strong else 110),
+                          False, mp, 3)
+        pygame.draw.lines(surf, (255, 244, 220, 80), False, mp, 1)
+        surf.blit(region_mask(tile.x, tile.y), (0, 0),
+                  special_flags=pygame.BLEND_RGBA_MULT)
         screen.blit(surf, (b.x, b.y))
+        banded.add(tile.rid)
+
+    # давление на каждом ребре войны (+ плавное течение во времени)
+    epc = getattr(game, "_edge_press", None)
+    if epc is None:
+        epc = game._edge_press = {}
+    raw = {}
+    seen_edges = set()
+    for r in game.regions:
+        for n in game.neighbors(r):
+            ek = (min(r.rid, n.rid), max(r.rid, n.rid))
+            if ek in seen_edges:
+                continue
+            war = game.at_war(r.owner, n.owner)
+            if not war:
+                # оккупация без войны (войска застряли после мира) —
+                # полоса нужна, если чужие силы реально стоят в провинции
+                if pair_press(r, n.owner) <= 0.02 and pair_press(n, r.owner) <= 0.02:
+                    continue
+            seen_edges.add(ek)
+            pair = (min(r.owner, n.owner), max(r.owner, n.owner))
+            if n.y == r.y:                       # граница вертикальная
+                axis, line = "v", max(r.x, n.x)
+                u = r.y + 0.5
+                west, east = (r, n) if r.x < n.x else (n, r)
+                pw = pair_press(west, east.owner)     # восток давит в запад
+                pe = pair_press(east, west.owner)     # запад давит в восток
+            else:                                # граница горизонтальная
+                axis, line = "h", max(r.y, n.y)
+                u = r.x + 0.5
+                north, south = (r, n) if r.y < n.y else (n, r)
+                pw = pair_press(north, south.owner)   # юг давит в север
+                pe = pair_press(south, north.owner)   # север давит в юг
+            old = epc.get(ek)
+            if old is None:
+                epc[ek] = (pw, pe)
+            else:
+                epc[ek] = (old[0] + (pw - old[0]) * 0.10,
+                           old[1] + (pe - old[1]) * 0.10)
+            pw, pe = epc[ek]
+            raw.setdefault((axis, line, pair), []).append(
+                (u, pw, pe, r, n, war))
+
+    # гауссово поле давления вдоль всей линии фронта
+    front = {}
+    for key, samples in raw.items():
+        axis, line, pair = key
+        ws = [(u, w, 1.0) for (u, w, e, r, n, war) in samples]
+        es = [(u, e, 1.0) for (u, w, e, r, n, war) in samples]
+        for dl in (-1, 1):
+            for (u2, w2, e2, r2, n2, wm) in raw.get((axis, line + dl, pair), ()):
+                ws.append((u2, w2, 0.35))
+                es.append((u2, e2, 0.35))
+        front[key] = (ws, es)
+
+    def field_at(samples, u):
+        if not samples:
+            return 0.0
+        sigma = 1.25 * TILE
+        num = den = 0.0
+        for (c, f, w) in samples:
+            wg = w * math.exp(-((u - c * TILE) ** 2) / (2.0 * sigma * sigma))
+            num += f * wg
+            den += wg
+        return num / den if den > 1e-9 else 0.0
+
+    FLOOR = 0.10         # базовая «линия войны» — видна на всём фронте
+    for key, samples in raw.items():
+        axis, line, pair = key
+        fw, fe = front[key]
+        for (u, pw, pe, r, n, war) in samples:
+            if axis == "v":
+                west, east = (r, n) if r.x < n.x else (n, r)
+                cov_w = field_at(fw, u)
+                cov_e = field_at(fe, u)
+                if war:      # на войне фронт виден везде — базовая линия
+                    cov_w = FLOOR + (1.0 - FLOOR) * cov_w
+                    cov_e = FLOOR + (1.0 - FLOOR) * cov_e
+                elif cov_w < 0.045 and cov_e < 0.045:
+                    continue
+                draw_band(west, faction_color(game, east.owner), (1, 0), cov_w)
+                draw_band(east, faction_color(game, west.owner), (-1, 0), cov_e)
+            else:
+                north, south = (r, n) if r.y < n.y else (n, r)
+                cov_n = field_at(fw, u)
+                cov_s = field_at(fe, u)
+                if war:
+                    cov_n = FLOOR + (1.0 - FLOOR) * cov_n
+                    cov_s = FLOOR + (1.0 - FLOOR) * cov_s
+                elif cov_n < 0.045 and cov_s < 0.045:
+                    continue
+                draw_band(north, faction_color(game, south.owner), (0, 1), cov_n)
+                draw_band(south, faction_color(game, north.owner), (0, -1), cov_s)
 
     # ---- проход 2: тонкие внутренние линии (как на примере) ----
     ls = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
@@ -2570,15 +2622,6 @@ def draw_map(screen, game, fonts):
             if hot:
                 pygame.draw.lines(fx, (255, 190, 120, 60), False, mp, 1)
     screen.blit(fx, (MAP_X, MAP_Y))
-
-    # ---- проход 5: линия боя внутри провинции (спокойная, статичная) ----
-    fxs = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
-    for r, col, inv_fid in contested:
-        pts, d, ox, oy = splits[r.rid]
-        mp = [(ox + px - MAP_X, oy + py - MAP_Y) for px, py in pts]
-        pygame.draw.lines(fxs, (28, 16, 10, 170), False, mp, 3)
-        pygame.draw.lines(fxs, (255, 244, 220, 80), False, mp, 1)
-    screen.blit(fxs, (MAP_X, MAP_Y))
 
     # ---- проход 6: вспышки боя ----
     for r in game.regions:
@@ -2639,7 +2682,7 @@ def draw_map(screen, game, fonts):
             draw_flag(screen, x + TILE - 26, y + 6, 14,
                       game.factions.get(r.owner))
         owner_share, inv_fid, inv_share = game.control(r)
-        if r.rid not in splits:
+        if r.rid not in banded:
             present = [(v, f) for f, v in r.forces.items() if v > 0.5]
             # цифры войск — только у выбранного региона и его соседей (G — все)
             if game.show_numbers or r.rid == sel or r.rid in neighbor_ids:
