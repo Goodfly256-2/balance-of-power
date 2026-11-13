@@ -26,15 +26,29 @@ NEUTRAL = -1
 
 TICK_RATE = 30              # шагов симуляции в секунду при скорости 1x
 SPEEDS = [1, 2, 4, 8]
-MOVE_TIME = 1.1             # секунд на переход между регионами
-FIELD_MIN = 200             # ниже этого отряд в поле считается уничтоженным
+
+# --- фронты (v2.4): войска живут только в резерве или на фронте ---------
+# Фронт — граница между воюющими странами (в начале — просто граница
+# провинций, «плоская»); войска размазаны по нему равномерно, выбрать
+# участок нельзя. Атака = случайный участок фронта, успех только при
+# превосходстве (техники, силы, стойки), потери у обеих сторон.
+DEPLOY_RATE = 1200.0        # солдат/сек: резерв разворачивается на фронты
+RETURN_RATE = 1800.0        # солдат/сек: возврат с фронта в резерв
+BATTLE_K = 0.02             # масштаб потерь во фронтовом бою (1/сек)
+BATTLE_TIME = (9.0, 15.0)   # длительность мини-атаки, сек (рандом)
+BATTLE_CD = 6.0             # пауза между атаками стороны на фронте
+ADV_MIN = 1.22              # минимальное превосходство для успешного захвата
+SEG_MAX = 3                 # максимальная ширина участка атаки (в рёбрах)
+NEUTRAL_GARRISON = 1300.0   # «виртуальный» гарнизон нейтрала на ребро
+FRONT_EDGE_REBUILD = 1.0    # пересчёт рёбер фронта, сек
+# одновременные мини-атаки на фронте (тактика): Манёвры / Удар / Оборона
+FRONT_BATTLES = [3, 2, 1]
 
 # --- повтор/просмотр игры ---
 HISTORY_INTERVAL = 1.0      # как часто сохраняется снимок карты (в игровых сек.)
 HISTORY_LIMIT = 4000        # максимум снимков
 REPLAY_SPS = 8.0            # снимков в секунду при просмотре (×скорость)
 
-COMBAT_K = 0.08             # масштаб потерь в бою (баллы в секунду)
 ATK_TECH, DEF_TECH, LOG_TECH, MOR_TECH = 0.55, 0.55, 0.30, 0.35
 
 # --- доктрины (тактика) ---
@@ -315,12 +329,15 @@ class Faction:
         self.wars = []               # список войн: {fid, start, end, losses, kills}
         self.kills = 0.0             # суммарные уничтоженные войска врага
         self.losses = 0.0            # суммарные потери
+        self.reserve = 0.0           # солдаты в резерве (не на фронте)
         self.game = None
 
     @property
     def total_troops(self):
-        total = sum(r.forces.get(self.fid, 0) for r in self.game.regions)
-        total += sum(m.amount for m in self.game.moves if m.fid == self.fid)
+        total = self.reserve
+        for front in self.game.war_fronts.values():
+            if self.fid in front.troops:
+                total += front.troops[self.fid]
         return total
 
     @property
@@ -338,14 +355,8 @@ class Region:
         self.pop = pop                  # население
         self.dev = 0                    # уровень развития экономики
         self.owner = NEUTRAL
-        self.forces = {NEUTRAL: 9000}   # fid -> soldiers
         self.capital_of = None
         self.flash = 0.0                # подсветка боя
-        self.entry = {}                 # fid -> (dx, dy): откуда пришёл атакующий
-        self.dshare = 0.0               # плавно отображаемая доля захвата
-
-    def owner_forces(self):
-        return self.forces.get(self.owner, 0.0)
 
     @property
     def income(self):
@@ -353,20 +364,90 @@ class Region:
                 * (1.0 + ECON_DEV_INCOME * self.dev))
 
 
-class Move:
-    def __init__(self, fid, amount, src, dst, duration):
-        self.fid = fid
-        self.amount = amount
-        self.src = src
-        self.dst = dst
-        self.duration = duration
-        self.t = 0.0
-        self.frozen = False          # застыла в встречном бою на середине пути
-        self.retreat = False         # отступает домой после перехвата
+class Front:
+    """Фронт между двумя сторонами (b может быть NEUTRAL).
 
-    @property
-    def progress(self):
-        return min(1.0, self.t / self.duration) if self.duration > 0 else 1.0
+    Фронт — плавная линия по границе территорий (в начале «плоская»), не
+    зависящая от провинций: войска размазаны по линии равномерно, выбрать
+    «где больше» нельзя. Линия делится на части; мини-атака выбирает
+    случайную часть и глубину и при превосходстве двигает линию вперёд.
+    push[i] — локальное смещение линии (в клетках, + в сторону b)."""
+
+    def __init__(self, a, b):
+        self.a = a                      # упорядоченная пара (min, max)
+        self.b = b
+        self.troops = {a: 0.0, b: 0.0}  # солдаты на фронте
+        self.stance = {a: "def", b: "def"}   # "def" | "att"
+        self.alloc = {a: 0.5, b: 0.5}        # доля армии на этом фронте
+        self.cd = {a: 2.0, b: 4.0}           # пауза до следующей атаки
+        self.line = []                  # [(x, y, nx, ny, rid_a, rid_b)]
+        self.push = []                  # смещения линии от базовой границы
+        self.battles = []               # активные мини-атаки
+
+    def other(self, fid):
+        return self.b if fid == self.a else self.a
+
+    def key(self):
+        return (self.a, self.b)
+
+
+def build_front_line(game, a, b, owner_of):
+    """Плавная линия фронта между сторонами a и b по границе территорий.
+
+    Возвращает (line, push): line = [(x, y, nx, ny, rid_a, rid_b)] — точки
+    через ~1 клетку вдоль границы, сглаженные; nx/ny — нормаль в сторону a;
+    push — нулевые смещения (линия «плоская» на текущей границе)."""
+    pts = []
+    seen = set()
+    for r in game.regions:
+        if owner_of(r.rid) not in (a, b):
+            continue
+        for n in game.neighbors(r):
+            if owner_of(n.rid) not in (a, b) or owner_of(n.rid) == owner_of(r.rid):
+                continue
+            ek = (min(r.rid, n.rid), max(r.rid, n.rid))
+            if ek in seen:
+                continue
+            seen.add(ek)
+            mx = (r.x + n.x) / 2.0
+            my = (r.y + n.y) / 2.0
+            ta, tb = (r, n) if owner_of(r.rid) == a else (n, r)
+            pts.append((mx, my, ta.rid, tb.rid))
+    if not pts:
+        return [], []
+    # порядок вдоль главной оси фронта
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    axx = sum((p[0] - cx) ** 2 for p in pts)
+    ayy = sum((p[1] - cy) ** 2 for p in pts)
+    axy = sum((p[0] - cx) * (p[1] - cy) for p in pts)
+    ang = 0.5 * math.atan2(2 * axy, axx - ayy)
+    dx, dy = math.cos(ang), math.sin(ang)
+    pts.sort(key=lambda p: (p[0] - cx) * dx + (p[1] - cy) * dy)
+    # сглаживание скользящим средним — линия плавная, без изломов
+    for _ in range(3):
+        sm = [pts[0]]
+        for i in range(1, len(pts) - 1):
+            sm.append(((pts[i - 1][0] + 2 * pts[i][0] + pts[i + 1][0]) / 4,
+                       (pts[i - 1][1] + 2 * pts[i][1] + pts[i + 1][1]) / 4,
+                       pts[i][2], pts[i][3]))
+        sm.append(pts[-1])
+        pts = sm
+    # нормали (в сторону a) и дедуп близких точек
+    line = []
+    for i, (x, y, rid_a, rid_b) in enumerate(pts):
+        p0 = pts[max(0, i - 1)]
+        p1 = pts[min(len(pts) - 1, i + 1)]
+        dxa, dya = p1[0] - p0[0], p1[1] - p0[1]
+        L = math.hypot(dxa, dya) or 1.0
+        nx, ny = -dya / L, dxa / L
+        # ориентир: центр тайла a относительно точки
+        ta = game.regions[rid_a]
+        dot = (ta.x + 0.5 - x) * nx + (ta.y + 0.5 - y) * ny
+        if dot < 0:
+            nx, ny = -nx, -ny
+        line.append((x, y, nx, ny, rid_a, rid_b))
+    return line, [0.0] * len(line)
 
 
 # ============================ ИГРА ============================
@@ -379,8 +460,8 @@ class Game:
         self.show_names = opts.get("show_names", True)   # названия стран на карте
         self.regions = []
         self.factions = {}
-        self.moves = []
-        self.field_clashes = []
+        self.war_fronts = {}            # (a, b) -> Front (b может быть NEUTRAL)
+        self._front_cache_dirty = True  # границы территорий менялись
         self.captures = []              # анимации смены владельца региона
         self.log = []
         self.time = 0.0
@@ -392,7 +473,6 @@ class Game:
         self.observer = False           # режим наблюдателя: все фракции за ИИ
         self.winner = None
         self.selected = None
-        self.move_mode = False
         self.show_numbers = bool(opts.get("show_numbers", False))
         self.tab = 0                    # 0 обзор, 1 регион, 2 дипломатия
         self.pending_offers = []        # входящие предложения игроку
@@ -463,15 +543,12 @@ class Game:
                 if bd is None or d < bd:
                     best, bd = fid, d
             r.owner = best
-            r.forces = {best: 0}
         # независимый центр
         if sc.get("neutral_core"):
             c = GRID // 2
-            gar = int(6000 * (GRID / 8.0) ** 2)
             for (x, y) in [(c - 1, c - 1), (c, c - 1), (c - 1, c), (c, c)]:
                 r = self.region_at(x, y)
                 r.owner = NEUTRAL
-                r.forces = {NEUTRAL: gar}
 
         # столицы (отмечаем до передачи регионов, чтобы столицы не переходили)
         for fid, (cx, cy) in enumerate(homes):
@@ -494,21 +571,17 @@ class Game:
                     break
                 r = self.rng.choice(cands)
                 r.owner = fid
-                r.forces = {fid: next(iter(r.forces.values()))}
 
-        # гарнизоны и развитие — по типу страны
+        # стартовая армия — в резерве; на фронты разворачивается сама
         army_mult = sc.get("army_mult", 1.0)
-        for fid, (cx, cy) in enumerate(homes):
-            cap = self.region_at(cx, cy)
-            kind = self.factions[fid].nation
+        for fid, f in self.factions.items():
+            kind = f.nation
+            cap = self.regions[f.capital]
             cap.dev = min(MAX_ECON_DEV, kind["dev"])
-            cap.forces = {fid: int(26000 * kind["army"] * army_mult)}
-            for r in self.regions:
-                if r.owner == fid and r is not cap:
-                    r.forces = {fid: int(self.rng.randint(7000, 11000)
-                                         * kind["army"] * army_mult)}
-                    if kind["dev"] > 1 and self.rng.random() < 0.35:
-                        r.dev = self.rng.randint(1, kind["dev"] - 1)
+            f.reserve = 30000 * kind["army"] * army_mult
+            for r in f.regions:
+                if r is not cap and kind["dev"] > 1 and self.rng.random() < 0.35:
+                    r.dev = self.rng.randint(1, kind["dev"] - 1)
 
         for f in self.factions.values():
             self.recalc_manpower(f, init=True)
@@ -531,6 +604,10 @@ class Game:
                     self.make_alliance(a, b)
             self.log_msg("Блоки сформированы — война началась!")
 
+        # фронты экспансии в нейтралов (без смежных нейтралов распадутся сами)
+        for fid in self.factions:
+            self.get_front(fid, NEUTRAL)
+
         self.record_snapshot()
         self.log_msg("Выберите фракцию, чтобы начать игру.")
 
@@ -539,7 +616,8 @@ class Game:
         self.history.append({
             "t": self.time,
             "owner": [r.owner for r in self.regions],
-            "forces": [int(r.owner_forces()) for r in self.regions],
+            "fronts": [[fr.a, fr.b, int(fr.troops[fr.a]), int(fr.troops[fr.b])]
+                       for fr in self.war_fronts.values()],
             "cap": [r.capital_of for r in self.regions],
         })
         if len(self.history) > HISTORY_LIMIT:
@@ -603,21 +681,18 @@ class Game:
 
     def _apply_siege_handicap(self, fid):
         """«Осаждённая твердыня»: у игрока остаётся только столица, остальные
-        земли делят соседи и усиливают гарнизоны. Выжить — уже победа."""
+        земли делят соседи, а их резервы растут. Выжить — уже победа."""
         f = self.factions[fid]
-        cap = self.regions[f.capital]
         others = [x for x in self.factions if x != fid]
-        lands = [r for r in f.regions if r is not cap]
+        lands = [r for r in f.regions]
         self.rng.shuffle(lands)
         for i, r in enumerate(lands):
-            force = int(r.forces.get(fid, 0))
             near = [n.owner for n in self.neighbors(r) if n.owner in others]
             new = self.rng.choice(near) if near else others[i % len(others)]
             r.owner = new
-            r.forces = {new: force}
         for x in others:
-            cf = self.regions[self.factions[x].capital]
-            cf.forces[x] = cf.forces.get(x, 0) + 20000
+            self.factions[x].reserve += 20000
+        f.reserve *= 0.4
         f.money = 150.0
         self.log_msg("Осада: ваши земли поделены соседями. Продержитесь!")
 
@@ -658,221 +733,269 @@ class Game:
             return True
         return self.at_war(a, b)
 
-    def control(self, r):
-        """Возвращает (доля владельца, сильнейший чужак, его доля)."""
-        owner_f = r.forces.get(r.owner, 0.0)
-        foreign = [(v, f) for f, v in r.forces.items() if f != r.owner and v > 0.5]
-        if not foreign:
-            return 1.0, None, 0.0
-        foreign.sort(reverse=True)
-        v, f = foreign[0]
-        total = owner_f + v
-        share = v / total if total > 0 else 0.0
-        return max(0.0, 1.0 - share), f, min(1.0, share)
+    # ==================== ФРОНТЫ (v2.4) ====================
+    def front_key(self, a, b):
+        return (a, b) if a < b else (b, a)
 
-    def battle_preview(self, r):
-        """Что происходит в бою за регион: силы, урон в секунду за/против."""
-        fids = [f for f, v in r.forces.items() if v > 0.5]
-        info = {f: {"troops": r.forces[f], "dealt": 0.0, "taken": 0.0,
-                    "owner": f == r.owner} for f in fids}
-        for i in range(len(fids)):
-            for j in range(i + 1, len(fids)):
-                a, b = fids[i], fids[j]
-                if not self.opposing(a, b):
-                    continue
-                fa, fb = r.forces[a], r.forces[b]
-                ra = (self.defense_rate(a, r, enemy_fid=b) if a == r.owner
-                      else self.attack_rate(a, enemy_fid=b))
-                rb = (self.defense_rate(b, r, enemy_fid=a) if b == r.owner
-                      else self.attack_rate(b, enemy_fid=a))
-                dealt_a = fb * rb * COMBAT_K
-                dealt_b = fa * ra * COMBAT_K
-                info[a]["dealt"] += dealt_a
-                info[a]["taken"] += dealt_b
-                info[b]["dealt"] += dealt_b
-                info[b]["taken"] += dealt_a
-        return info
+    def get_front(self, a, b):
+        """Фронт пары (создаётся при необходимости; b может быть NEUTRAL)."""
+        key = self.front_key(a, b)
+        fr = self.war_fronts.get(key)
+        if fr is None:
+            fr = Front(*key)
+            self.war_fronts[key] = fr
+            self._front_cache_dirty = True
+        return fr
 
-    def fronts(self, border_depth=2):
-        """Один «фронт» = непрерывный участок границы между двумя владельцами.
+    def drop_front(self, a, b):
+        """Фронт распущен (мир/нет границы) — войска в резерв."""
+        key = self.front_key(a, b)
+        fr = self.war_fronts.pop(key, None)
+        if fr:
+            for side in (fr.a, fr.b):
+                f = self.factions.get(side)
+                if f is not None:
+                    f.reserve += max(0.0, fr.troops[side])
+            self._front_cache_dirty = True
 
-        Числа на карте — не вся армия, а гарнизон приграничья: регионы каждой
-        стороны в пределах border_depth клеток от границы с противником,
-        суммированные вдоль фронта. У страны с двумя врагами — два независимых
-        фронта (и два числа), даже если враги примыкают к тем же землям."""
-        edges = []
-        for r in self.regions:
-            for dx, dy in ((1, 0), (0, 1)):
-                nx, ny = r.x + dx, r.y + dy
-                if not (0 <= nx < GRID and 0 <= ny < GRID):
-                    continue
-                n = self.region_at(nx, ny)
-                if r.owner == n.owner:
-                    continue
-                pair = (min(r.owner, n.owner), max(r.owner, n.owner))
-                edges.append({"pair": pair, "tiles": (r.rid, n.rid),
-                              "mx": (r.x + n.x) / 2.0, "my": (r.y + n.y) / 2.0})
+    def rebuild_front_lines(self):
+        """Плавные линии всех фронтов по текущим границам территорий."""
+        for fr in self.war_fronts.values():
+            # свой захват требует перестройки; заметные сдвиги без
+            # захватов не сбрасываем
+            if (fr.line and not getattr(fr, "needs_rebuild", False)
+                    and max(abs(p) for p in fr.push) >= 0.3):
+                continue
+            fr.line, fr.push = build_front_line(
+                self, fr.a, fr.b, lambda rid: self.regions[rid].owner)
+            fr.needs_rebuild = False
+        self._front_cache_dirty = False
 
-        parent = list(range(len(edges)))
+    def front_def_rate(self, fid, foe):
+        """Оборонительный множитель стороны на фронте (без рельефа)."""
+        f = self.factions.get(fid, self.neutral)
+        doc = DOCTRINES[f.doctrine] if f is not self.neutral else DOCTRINES[1]
+        de = 1.0 + DEF_TECH * f.tech["def"] + MOR_TECH * f.tech["mor"]
+        de += doc["def"] - 1.0
+        de += self.ideo_of(fid).get("def", 0.0)
+        if foe is not None and foe in self.factions:
+            de -= self.matchup_bonus(DOCTRINES[self.factions[foe].doctrine],
+                                     doc) * 0.5
+        de += f.morale / 100.0 * 0.3
+        return de
 
-        def find(i):
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            return i
-
-        def union(i, j):
-            ri, rj = find(i), find(j)
-            if ri != rj:
-                parent[rj] = ri
-
-        by_tile = {}
-        for idx, e in enumerate(edges):
-            for t in e["tiles"]:
-                by_tile.setdefault(t, []).append(idx)
-        for idx, e in enumerate(edges):
-            for t in e["tiles"]:
-                for other in by_tile[t]:
-                    if other != idx and edges[other]["pair"] == e["pair"]:
-                        union(idx, other)
-        # второй проход: соединяем рёбра одного фронта-пары, чьи клетки
-        # ПРИМЫКАЮТ друг к другу (общей клетки нет, но это тот же фронт):
-        # ребро (r1,n1) и ребро (r2,n2) соединены, если r1–r2 соседи и
-        # n1–n2 соседи (или зеркально) — так прямой длинный фронт не рвётся
-        # на куски по одной клетке
-        def adjacent_tiles(e1, e2):
-            a1, b1 = e1["tiles"]
-            a2, b2 = e2["tiles"]
-            ra1, rn1 = self.regions[a1], self.regions[b1]
-            ra2, rn2 = self.regions[a2], self.regions[b2]
-            s1 = (a1, b1)
-            s2 = (a2, b2)
-            for (x1, y1), (x2, y2) in ((s1, s2), (s2, s1)):
-                if abs(ra1.x - ra2.x) + abs(ra1.y - ra2.y) == 1 \
-                        and abs(rn1.x - rn2.x) + abs(rn1.y - rn2.y) == 1:
-                    return True
+    def set_stance(self, a, b, stance, fid=None):
+        """Стойка на фронте: "def" (Оборона) или "att" (Атака)."""
+        fr = self.war_fronts.get(self.front_key(a, b))
+        if fr is None or stance not in ("def", "att"):
             return False
+        side = fid if fid is not None else a
+        if side not in fr.troops:
+            return False
+        fr.stance[side] = stance
+        return True
 
-        for idx in range(len(edges)):
-            for jdx in range(idx + 1, len(edges)):
-                if edges[idx]["pair"] != edges[jdx]["pair"]:
+    def _pick_span(self, fr, adv):
+        """Случайная часть фронта и расстояние атаки (в частях линии).
+
+        Фронт делится на части примерно по 3 клетки; атака накрывает одну
+        или две смежные части — «случайное расстояние и часть фронта»."""
+        n = len(fr.line)
+        if n < 2:
+            return 0, 0
+        part = max(3, n // 4)
+        parts = max(1, (n + part - 1) // part)
+        p0 = self.rng.randrange(parts)
+        extra = 1 if (adv > 1.6 and self.rng.random() < 0.6) else 0
+        i0 = p0 * part
+        i1 = min(n, (p0 + 1 + extra) * part)
+        return i0, i1
+
+    def _front_push(self, fr, att, i0, i1, depth):
+        """Двигает участок линии: успех — вперёд, провалившаяся атака —
+        назад. Линия ходит плавными буграми (косинус-спад к краям участка),
+        а не синусоидой. Провинция переключается, когда линия прошла её
+        центр. Возвращает число переключений."""
+        dirv = 1.0 if att == fr.a else -1.0
+        m = max(1, i1 - i0)
+        for j in range(m):
+            i = i0 + j
+            if not 0 <= i < len(fr.push):
+                continue
+            fall = math.sin(math.pi * (j + 0.5) / m)
+            fr.push[i] = max(-1.4, min(1.4, fr.push[i] + dirv * depth * fall))
+        for i in (i0 - 1, i1):
+            if 0 <= i < len(fr.push):
+                fr.push[i] = max(-1.4, min(1.4,
+                                           fr.push[i] + dirv * depth * 0.2))
+        flips = 0
+        for i in range(max(0, i0 - 2), min(len(fr.push), i1 + 2)):
+            _, _, _, _, rid_a, rid_b = fr.line[i]
+            if fr.push[i] > 0.42:
+                t = self.regions[rid_b]
+                if t.owner == fr.b:
+                    self._flip_tile(t, fr.a)
+                    flips += 1
+            elif fr.push[i] < -0.42:
+                t = self.regions[rid_a]
+                if t.owner == fr.a:
+                    self._flip_tile(t, fr.b)
+                    flips += 1
+        if flips:
+            fr.needs_rebuild = True   # линия перестраивается по новой границе
+        return flips
+
+    def _flip_tile(self, r, new_owner):
+        """Смена владельца провинции при движении линии фронта."""
+        old = r.owner
+        r.owner = new_owner
+        if new_owner != NEUTRAL:
+            self.factions[new_owner].morale = min(150.0,
+                                                  self.factions[new_owner].morale + 3)
+        if old != NEUTRAL:
+            self.factions[old].morale = max(20.0,
+                                            self.factions[old].morale - 4)
+        who = ("независимые" if new_owner == NEUTRAL
+               else "«" + self.factions[new_owner].name + "»")
+        self.log_msg("(" + str(r.x) + "," + str(r.y) + ") занят: " + who)
+        col = (self.factions[new_owner].color if new_owner != NEUTRAL
+               else NEUTRAL_COL)
+        self.captures.append({"rid": r.rid, "fid": new_owner, "col": col,
+                              "t": 0.0})
+
+    def update_fronts(self, dt):
+        """Жизнь фронтов: развёртывание резерва, мини-атаки, потери, захваты.
+
+        Войска на фронте размазаны равномерно по рёбрам границы; атака
+        бьёт по случайному участку и захватывает территорию только при
+        превосходстве (техники, силы, стойки, доктрины). Потери у обеих
+        сторон; мини-атак может быть несколько одновременно (тактика)."""
+        # 1) линии фронтов: пересчёт по таймеру или после захвата
+        self._front_timer = getattr(self, "_front_timer", 0.0) - dt
+        if self._front_cache_dirty or self._front_timer <= 0:
+            self._front_timer = FRONT_EDGE_REBUILD
+            self.rebuild_front_lines()
+        # фронты без линии распускаются — войска в резерв
+        for key in list(self.war_fronts):
+            if not self.war_fronts[key].line:
+                self.drop_front(*key)
+        # 2) распределение: доли армии (alloc) по фронтам, остаток — резерв
+        for f in self.factions.values():
+            if not f.alive:
+                continue
+            mine = [fr for fr in self.war_fronts.values()
+                    if f.fid in fr.troops and fr.line]
+            if not mine:
+                continue
+            total = f.reserve + sum(fr.troops[f.fid] for fr in mine)
+            s = sum(max(0.05, fr.alloc.get(f.fid, 0.5)) for fr in mine)
+            for fr in mine:
+                target = total * max(0.05, fr.alloc.get(f.fid, 0.5)) / max(1.0, s)
+                cur = fr.troops[f.fid]
+                if cur < target - 1:
+                    mv = min(target - cur, f.reserve, DEPLOY_RATE * dt)
+                    fr.troops[f.fid] += mv
+                    f.reserve -= mv
+                elif cur > target + 1:
+                    mv = min(cur - target, RETURN_RATE * dt)
+                    fr.troops[f.fid] -= mv
+                    f.reserve += mv
+        # 3) битвы на фронтах
+        for fr in self.war_fronts.values():
+            if not fr.line:
+                continue
+            n = max(1, len(fr.line))
+            for side in (fr.a, fr.b):
+                if side == NEUTRAL:
                     continue
-                if find(idx) == find(jdx):
+                f = self.factions.get(side)
+                if f is None or not f.alive:
                     continue
-                if adjacent_tiles(edges[idx], edges[jdx]):
-                    union(idx, jdx)
-
-        groups = {}
-        for idx, e in enumerate(edges):
-            groups.setdefault(find(idx), []).append(e)
-
-        out = []
-        for segs in groups.values():
-            pair = segs[0]["pair"]
-            tiles = set()
-            for e in segs:
-                tiles.update(e["tiles"])
-            contested = False
-            for rid in tiles:
-                if len([f for f, v in self.regions[rid].forces.items() if v > 0.5]) > 1:
-                    contested = True
-                    break
-
-            # гарнизон приграничья: BFS от фронта на border_depth вглубь
-            troops = {pair[0]: 0.0, pair[1]: 0.0, "total": 0.0}
-            side_pts = {pair[0]: [0.0, 0.0, 0], pair[1]: [0.0, 0.0, 0]}
-            seen = set()
-            for side in pair:
-                frontier = [rid for rid in tiles
-                            if self.regions[rid].owner == side]
-                layer = set(frontier)
-                depth_seen = set(frontier)
-                for _ in range(max(0, border_depth - 1)):
-                    nxt = set()
-                    for rid in layer:
-                        r = self.regions[rid]
-                        for n in self.neighbors(r):
-                            if (n.owner == side and n.rid not in depth_seen):
-                                nxt.add(n.rid)
-                                depth_seen.add(n.rid)
-                    layer = nxt
-                for rid in depth_seen:
-                    reg = self.regions[rid]
-                    v = 0.0
-                    for f2 in pair:
-                        fv = reg.forces.get(f2, 0.0)
-                        if fv > 0.5:
-                            v += fv
-                    troops[side] += v
-                    if rid not in seen:
-                        seen.add(rid)
-                    if reg.owner == side:
-                        sp = side_pts[side]
-                        sp[0] += reg.x + 0.5
-                        sp[1] += reg.y + 0.5
-                        sp[2] += 1
-            troops["total"] = troops[pair[0]] + troops[pair[1]]
-            mx = sum(e["mx"] for e in segs) / len(segs)
-            my = sum(e["my"] for e in segs) / len(segs)
-            sxx = sum((e["mx"] - mx) ** 2 for e in segs)
-            syy = sum((e["my"] - my) ** 2 for e in segs)
-            sxy = sum((e["mx"] - mx) * (e["my"] - my) for e in segs)
-            angle = math.degrees(0.5 * math.atan2(2 * sxy, sxx - syy)) if len(segs) > 1 else 0.0
-            pos = {}
-            for side in pair:
-                sx, sy, n = side_pts[side]
-                pos[side] = (sx / n, sy / n) if n else (mx, my)
-
-            # линия фронта для надписей: середины рёбер, упорядоченные вдоль
-            # главной оси и сглаженные — текст изгибается по этой кривой
-            mids = [(e["mx"], e["my"]) for e in segs]
-            if len(mids) >= 2:
-                cx0 = sum(p[0] for p in mids) / len(mids)
-                cy0 = sum(p[1] for p in mids) / len(mids)
-                axx = sum((p[0] - cx0) ** 2 for p in mids)
-                ayy = sum((p[1] - cy0) ** 2 for p in mids)
-                axy = sum((p[0] - cx0) * (p[1] - cy0) for p in mids)
-                dir_ang = 0.5 * math.atan2(2 * axy, axx - ayy)
-                d = (math.cos(dir_ang), math.sin(dir_ang))
-                mids.sort(key=lambda p: (p[0] - cx0) * d[0] + (p[1] - cy0) * d[1])
-                # текст читается слева направо (или сверху вниз на вертикали)
-                if d[0] < 0 or (abs(d[0]) < 1e-6 and d[1] < 0):
-                    mids.reverse()
-                for _ in range(4):        # скользящее среднее — гладкая кривая
-                    sm = [mids[0]]
-                    for i in range(1, len(mids) - 1):
-                        sm.append(((mids[i - 1][0] + 2 * mids[i][0] + mids[i + 1][0]) / 4,
-                                   (mids[i - 1][1] + 2 * mids[i][1] + mids[i + 1][1]) / 4))
-                    sm.append(mids[-1])
-                    mids = sm
-                # прореживание: убираем точки ближе трети тайла — меньше изломов
-                th = TILE * 0.34
-                pruned = [mids[0]]
-                for p in mids[1:]:
-                    if math.hypot(p[0] - pruned[-1][0], p[1] - pruned[-1][1]) * TILE >= th:
-                        pruned.append(p)
-                if len(pruned) >= 2:
-                    mids = pruned
-                    for _ in range(2):    # ещё раз сглаживаем после прореживания
-                        sm = [mids[0]]
-                        for i in range(1, len(mids) - 1):
-                            sm.append(((mids[i - 1][0] + 2 * mids[i][0] + mids[i + 1][0]) / 4,
-                                       (mids[i - 1][1] + 2 * mids[i][1] + mids[i + 1][1]) / 4))
-                        sm.append(mids[-1])
-                        mids = sm
-            else:
-                a, b = segs[0]["tiles"]
-                if abs(a - b) == 1:       # вертикальная граница — путь вдоль неё
-                    mids = [(segs[0]["mx"], segs[0]["my"] - 0.5),
-                            (segs[0]["mx"], segs[0]["my"] + 0.5)]
+                foe = fr.other(side)
+                if foe != NEUTRAL and (not self.at_war(side, foe)
+                                       or self.time < self.grace_time):
+                    continue
+                fr.cd[side] -= dt
+                if fr.stance[side] != "att" or fr.cd[side] > 0:
+                    continue
+                if fr.troops[side] < 500:
+                    continue
+                max_battles = FRONT_BATTLES[f.doctrine]
+                mine = sum(1 for b in fr.battles if b["att"] == side)
+                if mine >= max_battles:
+                    continue
+                my_local = fr.troops[side] / n
+                foe_local = (fr.troops[foe] / n if foe != NEUTRAL
+                             else NEUTRAL_GARRISON)
+                a_rate = self.attack_rate(side, enemy_fid=foe)
+                d_rate = (self.front_def_rate(foe, side) if foe != NEUTRAL
+                          else 1.0)
+                # развед боем: атака возможна и при паритете (потери обеих
+                # сторон), захват — только при реальном превосходстве
+                adv = my_local * a_rate / max(1.0, foe_local * d_rate)
+                if adv < 0.85:
+                    continue
+                i0, i1 = self._pick_span(fr, adv)
+                if i1 <= i0:
+                    continue
+                # участок не может задействовать больше войск, чем есть
+                # на фронте: перекрывающиеся атаки суммируются
+                engaged = sum(b["i1"] - b["i0"] for b in fr.battles
+                              if b["att"] == side)
+                if fr.battles and (engaged + i1 - i0) / n > 0.75:
+                    continue
+                fr.battles.append({"att": side, "i0": i0, "i1": i1, "t": 0.0,
+                                   "dur": self.rng.uniform(*BATTLE_TIME),
+                                   "acc": 0.0})
+                fr.cd[side] = BATTLE_CD
+            # тик активных атак
+            done = []
+            for btl in fr.battles:
+                btl["t"] += dt
+                att, dfd = btl["att"], fr.other(btl["att"])
+                span = btl["i1"] - btl["i0"]
+                atk_local = fr.troops[att] / n * span
+                if dfd == NEUTRAL:
+                    def_local = NEUTRAL_GARRISON * span * 0.7
                 else:
-                    mids = [(segs[0]["mx"] - 0.5, segs[0]["my"]),
-                            (segs[0]["mx"] + 0.5, segs[0]["my"])]
-
-            out.append({"pair": pair, "mx": mx, "my": my, "troops": troops,
-                        "contested": contested, "angle": angle, "pos": pos,
-                        "path": mids})
-        return out
+                    def_local = fr.troops[dfd] / n * span
+                a_rate = self.attack_rate(att, enemy_fid=dfd) * 1.10
+                d_rate = self.front_def_rate(dfd, att)
+                if fr.stance[dfd] == "def":
+                    d_rate *= 1.22
+                # потери обеих сторон (нейтрал потерь не несёт)
+                a_loss = def_local * d_rate * BATTLE_K * dt
+                fr.troops[att] = max(0.0, fr.troops[att] - a_loss)
+                self.note_casualties(att, a_loss, dfd)
+                if dfd != NEUTRAL:
+                    d_loss = atk_local * a_rate * BATTLE_K * dt
+                    fr.troops[dfd] = max(0.0, fr.troops[dfd] - d_loss)
+                    self.note_casualties(dfd, d_loss, att)
+                # вспышки боя на тайлах у участка линии
+                for i in range(btl["i0"], min(btl["i1"], n)):
+                    _, _, _, _, rid_a, rid_b = fr.line[i]
+                    self.regions[rid_a].flash = 1.0
+                    self.regions[rid_b].flash = 1.0
+                # накопленное превосходство за бой
+                btl["acc"] += (atk_local * a_rate
+                               / max(1.0, def_local * d_rate)) * dt
+                if btl["t"] >= btl["dur"] or fr.troops[att] < 200:
+                    done.append(btl)
+            for btl in done:
+                fr.battles.remove(btl)
+                att = btl["att"]
+                dfd = fr.other(att)
+                if fr.troops[att] < 200:
+                    continue          # атака захлебнулась в потерях
+                adv = btl["acc"] / max(0.1, btl["t"])
+                if adv < ADV_MIN * self.rng.uniform(0.95, 1.15):
+                    # неудача: противник контратакует — линия назад
+                    self._front_push(fr, fr.other(att), btl["i0"], btl["i1"],
+                                     0.22 + 0.12 * self.rng.random())
+                    continue
+                depth = 0.55 + 0.45 * min(1.5, adv - 1.0)
+                if self._front_push(fr, att, btl["i0"], btl["i1"], depth):
+                    self._front_cache_dirty = True
 
     def ideo_of(self, fid):
         f = self.factions.get(fid)
@@ -885,14 +1008,14 @@ class Game:
         f.manpower_max = max(4000.0, pop * MANPOWER_MAX_FRAC * info["max"])
         f.manpower = min(f.manpower, f.manpower_max)
 
-    def recruit(self, rid, fid=None):
+    def recruit(self, fid=None):
+        """Набор в резерв: деньги + люди -> солдаты резерва."""
         f = self.factions[fid if fid is not None else self.player]
-        r = self.regions[rid]
-        if r.owner != f.fid or f.money < RECRUIT_COST or f.manpower < MANPOWER_PER_RECRUIT:
+        if f.money < RECRUIT_COST or f.manpower < MANPOWER_PER_RECRUIT:
             return False
         f.money -= RECRUIT_COST
         f.manpower -= MANPOWER_PER_RECRUIT
-        r.forces[f.fid] = r.forces.get(f.fid, 0) + RECRUIT_AMOUNT
+        f.reserve += RECRUIT_AMOUNT
         return True
 
     def develop_econ(self, rid, fid=None):
@@ -916,23 +1039,10 @@ class Game:
             return False
         f.money -= cost
         f.tech[track] = lvl + 1
-        names = {"atk": "атака", "def": "оборона", "log": "логистика", "mor": "мораль"}
+        names = {"atk": "атака", "def": "оборона", "log": "логистика",
+                 "mor": "мораль"}
         self.log_msg(f"{f.name}: {names[track]} → ур.{lvl + 1}")
         return True
-
-    def army_speed(self, fid):
-        f = self.factions[fid]
-        doc = DOCTRINES[f.doctrine]
-        fuel = f.tech2.get("fuel", 0) * TECH_TRACKS[2]["speed"]
-        return MOVE_TIME / ((1.0 + LOG_TECH * f.tech["log"]) * doc["speed"] + fuel)
-
-    def region_contested(self, r, fid=None):
-        """В регионе идёт бой: чужие войска противостоят владельцу."""
-        for f, v in r.forces.items():
-            if v > 0.5 and f != r.owner and self.opposing(r.owner, f):
-                if fid is None or fid in (r.owner, f):
-                    return True
-        return False
 
     # -------- призыв --------
     def conscript_info(self, fid):
@@ -955,33 +1065,7 @@ class Game:
         self.log_msg(f"{f.name}: призыв → «{CONSCRIPT[f.conscript]['name']}»")
         return True
 
-    def send_move(self, src_id, dst_id, fid, frac):
-        src = self.regions[src_id]
-        dst = self.regions[dst_id]
-        if src.owner != fid:
-            return False
-        if self.region_contested(src, fid):
-            self.log_msg("Регион под боем — войска связаны обороной и не могут выйти.")
-            return False
-        available = src.forces.get(fid, 0)
-        amount = int(available * frac)
-        if amount < 200:
-            return False
-        if amount >= available:
-            amount = int(available * 0.95)   # небольшой гарнизон остаётся дома
-        if dst.owner != fid and dst.owner != NEUTRAL:
-            if self.allied(fid, dst.owner):
-                self.log_msg("Нельзя атаковать союзника.")
-                return False
-            if self.has_nap(fid, dst.owner):
-                self.log_msg("Пакт о ненападении запрещает нападать.")
-                return False
-            if not self.at_war(fid, dst.owner):
-                self.declare_war(fid, dst.owner)
-        src.forces[fid] = available - amount
-        self.moves.append(Move(fid, amount, src_id, dst_id, self.army_speed(fid)))
-        return True
-
+    # -------- стойки фронтов --------
     # -------- дипломатия --------
     def declare_war(self, a, b, quiet=False):
         if a == b or a == NEUTRAL or b == NEUTRAL:
@@ -1006,6 +1090,7 @@ class Game:
                 self.factions[x].wars.pop(0)
         if not quiet:
             self.log_msg(f"«{self.factions[a].name}» объявляет войну «{self.factions[b].name}»!")
+        self.get_front(a, b)
         # СОЮЗНЫЙ ДОЛГ: на союзника напали — он обязательно вступает в войну
         # против агрессора. Нападавший на союзника знал, на что идёт.
         defender_allies = [x for x in self.factions[b].alliance
@@ -1039,6 +1124,7 @@ class Game:
                     w["end"] = self.time
         self.factions[a].relations[b] = min(30, self.factions[a].relations[b] + 25)
         self.factions[b].relations[a] = min(30, self.factions[b].relations[a] + 25)
+        # фронт остаётся как оборона границы (можно держать войска заранее)
         self.log_msg(f"Мир между «{self.factions[a].name}» и «{self.factions[b].name}».")
 
     def make_alliance(self, a, b):
@@ -1282,58 +1368,59 @@ class Game:
         if war is not None:
             war["losses"] += loss
 
-    def update_combat(self, dt):
-        for r in self.regions:
-            fids = [x for x, v in r.forces.items() if v > 0.5]
-            if len(fids) < 2:
-                continue
-            losses = {}
-            for i in range(len(fids)):
-                for j in range(i + 1, len(fids)):
-                    a, b = fids[i], fids[j]
-                    if a != NEUTRAL and b != NEUTRAL and not self.at_war(a, b):
-                        continue
-                    fa = r.forces[a]
-                    fb = r.forces[b]
-                    ra = (self.defense_rate(a, r, enemy_fid=b) if a == r.owner
-                          else self.attack_rate(a, enemy_fid=b))
-                    rb = (self.defense_rate(b, r, enemy_fid=a) if b == r.owner
-                          else self.attack_rate(b, enemy_fid=a))
-                    losses[a] = losses.get(a, 0.0) + fb * rb * COMBAT_K * dt
-                    losses[b] = losses.get(b, 0.0) + fa * ra * COMBAT_K * dt
-                    r.flash = 1.0
-            for x, d in losses.items():
-                r.forces[x] = max(0.0, r.forces.get(x, 0.0) - d)
-            # учёт потерь: главная причина потерь a — сильнейший враг в регионе
-            for a in losses:
-                foes = [(fb, b) for b, fb in
-                        ((x, r.forces.get(x, 0.0)) for x in fids if x != a) if fb > 0.5]
-                if foes:
-                    _, main = max(foes)
-                    self.note_casualties(a, losses[a], main)
-            self.resolve_ownership(r)
+    def war_rows(self):
+        """Строки вкладки «Войны»: войны, экспансия, границы до войны.
 
-    def resolve_ownership(self, r):
-        present = {x: v for x, v in r.forces.items() if v > 0.5}
-        r.forces = present
-        if r.owner_forces() > 0.5:
-            return
-        candidates = [(v, x) for x, v in present.items() if x != r.owner]
-        if not candidates:
-            return
-        v, new_owner = max(candidates)
-        old = r.owner
-        r.owner = new_owner
-        r.entry = {}
-        if new_owner != NEUTRAL:
-            self.factions[new_owner].morale = min(150.0, self.factions[new_owner].morale + 4)
-        if old != NEUTRAL:
-            self.factions[old].morale = max(20.0, self.factions[old].morale - 5)
-        who = "независимые" if new_owner == NEUTRAL else f"«{self.factions[new_owner].name}»"
-        self.log_msg(f"({r.x},{r.y}) захвачен: {who}")
-        r.capital_of = None if new_owner != r.capital_of else r.capital_of
-        col = self.factions[new_owner].color if new_owner != NEUTRAL else NEUTRAL_COL
-        self.captures.append({"rid": r.rid, "fid": new_owner, "col": col, "t": 0.0})
+        Один источник для отрисовки и кликов: войны игрока (все у
+        наблюдателя), экспансия в нейтралы и мирные границы, которые можно
+        заранее оборонять."""
+        observer = self.player is None
+        rows = []
+        if not observer:
+            fr = self.war_fronts.get(self.front_key(NEUTRAL, self.player))
+            if fr is not None and fr.line:
+                rows.append({"kind": "neutral", "front": fr, "h": 50})
+        pf_f = self.factions.get(self.player) if not observer else \
+            self.factions[0]
+        seen = set()
+        for f in self.factions.values():
+            if not observer and f.fid != pf_f.fid:
+                continue
+            for w in f.wars:
+                pair = tuple(sorted((f.fid, w["fid"])))
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                fr = self.war_fronts.get(self.front_key(f.fid, w["fid"]))
+                rows.append({"kind": "war", "f": f, "w": w, "front": fr,
+                             "h": 50})
+        if not observer:
+            # мирные границы: можно заранее оборонять (или напасть)
+            foes = set()
+            for r in self.factions[self.player].regions:
+                for n in self.neighbors(r):
+                    if (n.owner != self.player and n.owner != NEUTRAL
+                            and n.owner in self.factions
+                            and not self.at_war(self.player, n.owner)):
+                        foes.add(n.owner)
+            for foe in sorted(foes):
+                fr = self.war_fronts.get(self.front_key(self.player, foe))
+                rows.append({"kind": "pre_war", "foe": foe, "front": fr,
+                             "h": 50})
+        sort = getattr(self, "war_sort", "time")
+
+        def sort_key(row):
+            w = row.get("w")
+            if w is None:
+                return -1e18
+            if sort == "losses":
+                return -(w["losses"] + w["kills"])
+            if sort == "kills":
+                return -(w["kills"] - w["losses"])
+            return -w["start"]
+
+        rows.sort(key=sort_key)
+        return rows
 
     def faction_income(self, fid):
         f = self.factions[fid]
@@ -1342,8 +1429,7 @@ class Game:
         for other in f.trade:
             if other in self.factions:
                 trade_bonus += TRADE_INCOME
-        return base * trade_bonus * CONSCRIPT[f.conscript]["income"] * f.econ_mult \
-            * self.ideo_of(fid).get("econ", 1.0)
+        return base * trade_bonus * CONSCRIPT[f.conscript]["income"] * f.econ_mult             * self.ideo_of(fid).get("econ", 1.0)
 
     def faction_upkeep(self, fid):
         return self.factions[fid].total_troops / 1000.0 * UPKEEP_PER_1K
@@ -1372,159 +1458,10 @@ class Game:
             else:
                 f.morale = max(100.0, f.morale - 0.4 * dt)
 
-    def update_moves(self, dt):
-        # 1) встречные бои: враждебные армии, идущие навстречу по одному ребру,
-        #    останавливаются на середине и сражаются (никто не проходит сквозь).
-        self.field_clashes = []
-        n = len(self.moves)
-        for i in range(n):
-            m1 = self.moves[i]
-            if m1.amount <= 0:
-                continue
-            for j in range(i + 1, n):
-                m2 = self.moves[j]
-                if m2.amount <= 0:
-                    continue
-                if m1.src != m2.dst or m1.dst != m2.src:
-                    continue
-                if m1.fid == m2.fid:
-                    continue
-                if not self.opposing(m1.fid, m2.fid) or self.allied(m1.fid, m2.fid):
-                    continue
-                if m1.progress + m2.progress < 1.0:
-                    continue
-                self.field_clash(m1, m2, dt)
-        # 2) перехват: враждебные армии, чьи пути пересекаются (общая цель или
-        #    цель одной = источник другой). Слабый отряд уничтожается в поле,
-        #    сильный отступает домой с потерями; перехватчик идёт дальше.
-        for i in range(n):
-            m1 = self.moves[i]
-            if m1.amount <= 0 or m1.frozen or m1.retreat:
-                continue
-            for j in range(n):
-                if i == j:
-                    continue
-                m2 = self.moves[j]
-                if m2.amount <= 0 or m2.fid == m1.fid or m2.retreat:
-                    continue
-                if not self.opposing(m1.fid, m2.fid):
-                    continue
-                crossing = (m1.dst == m2.dst
-                            or (m1.dst == m2.src and m2.src != m1.src))
-                if not crossing:
-                    continue
-                # перехватывает тот, кто ближе к точке пересечения
-                ambusher, victim = (m1, m2) if m1.progress >= m2.progress else (m2, m1)
-                if victim.frozen or victim.retreat:
-                    continue
-                self.intercept_move(victim, ambusher)
-        # 3) движение уцелевших
-        done = []
-        for m in self.moves:
-            if m.frozen:
-                if m.amount < FIELD_MIN:
-                    done.append(m)
-                continue
-            m.t += dt
-            if m.retreat:
-                # отступление: армия возвращается в исходный регион
-                m.t += dt * 2.0            # бегство вдвое быстрее
-                if m.t >= m.duration:
-                    src = self.regions[m.src]
-                    src.forces[m.fid] = src.forces.get(m.fid, 0.0) + m.amount
-                    done.append(m)
-                continue
-            if m.t >= m.duration:
-                dst = self.regions[m.dst]
-                src = self.regions[m.src]
-                dst.forces[m.fid] = dst.forces.get(m.fid, 0.0) + m.amount
-                if dst.owner != m.fid:
-                    dst.entry[m.fid] = (src.x - dst.x, src.y - dst.y)
-                self.resolve_ownership(dst)
-                done.append(m)
-        for m in done:
-            self.moves.remove(m)
-
-    def intercept_move(self, victim, ambusher):
-        """Перехват на марше: слабого уничтожают в поле, сильный отступает.
-
-        Отношение сил решает исход: victim < 60% от ambushера — разгром,
-        иначе отступление домой с потерями (примерно треть отряда)."""
-        ratio = victim.amount / max(1.0, ambusher.amount)
-        vfid, afid = victim.fid, ambusher.fid
-        va = victim.amount
-        v_rate = self.attack_rate(vfid, enemy_fid=afid, in_field=True)
-        a_rate = self.attack_rate(afid, enemy_fid=vfid, in_field=True)
-        if ratio < 0.6:
-            # разгромлен в поле
-            victim.amount = 0.0
-            self.note_casualties(vfid, va, afid)
-            self.log_msg(f"Армия {self.fname(vfid)} разгромлена на марше "
-                         f"у провинции ({self.regions[victim.dst].x},{self.regions[victim.dst].y})")
-        else:
-            # вынужденное отступление: потери от огня на марше, остатки домой
-            edge = min(1.0, 0.15 + 0.35 * (1.0 - min(1.0, ratio)) * a_rate / max(0.1, v_rate))
-            lost = int(va * min(0.5, edge))
-            victim.amount = max(0.0, va - lost)
-            self.note_casualties(vfid, lost, afid)
-            if victim.amount < FIELD_MIN:
-                victim.amount = 0.0
-                self.log_msg(f"Отступающая армия {self.fname(vfid)} добита на марше")
-            else:
-                # разворот: источником становится прежняя цель
-                victim.src, victim.dst = victim.dst, victim.src
-                victim.t = 0.0
-                victim.retreat = True
-                victim.duration = max(0.4, victim.duration)
-                self.log_msg(f"Армия {self.fname(vfid)} перехвачена и отступает "
-                             f"(потери {fmt(lost)})")
-        if victim.amount <= 0.0:
-            victim.frozen = False
-            victim.retreat = False
-
-    def field_clash(self, m1, m2, dt):
-        """Встречный бой в поле между двумя движущимися армиями."""
-        new = not m1.frozen
-        m1.t = m1.duration * 0.5
-        m2.t = m2.duration * 0.5
-        m1.frozen = True
-        m2.frozen = True
-        r1 = self.attack_rate(m1.fid, enemy_fid=m2.fid, in_field=True)
-        r2 = self.attack_rate(m2.fid, enemy_fid=m1.fid, in_field=True)
-        a1, a2 = m1.amount, m2.amount
-        m1.amount = max(0.0, a1 - a2 * r2 * COMBAT_K * dt)
-        m2.amount = max(0.0, a2 - a1 * r1 * COMBAT_K * dt)
-        self.note_casualties(m1.fid, a1 - m1.amount, m2.fid)
-        self.note_casualties(m2.fid, a2 - m2.amount, m1.fid)
-        self.field_clashes.append((m1, m2))
-        if new:
-            self.log_msg(f"Встречный бой: {self.fname(m1.fid)} × {self.fname(m2.fid)}")
-        if m1.amount < FIELD_MIN <= m2.amount:
-            m2.frozen = False
-        elif m2.amount < FIELD_MIN <= m1.amount:
-            m1.frozen = False
-
     def fname(self, fid):
         if fid == NEUTRAL:
             return "независимые"
         return self.factions[fid].name
-
-    def attack_dir(self, r, fid):
-        """Направление (dx,dy), откуда идёт атака fid на регион r."""
-        best, best_f = None, -1.0
-        for n in self.neighbors(r):
-            if n.owner == fid and n.owner_forces() > best_f:
-                best_f = n.owner_forces()
-                best = (n.x - r.x, n.y - r.y)
-        if best:
-            return best
-        d = r.entry.get(fid)
-        if d and (d[0] or d[1]):
-            return d
-        for n in self.neighbors(r):
-            if fid in n.forces:
-                return (n.x - r.x, n.y - r.y)
-        return (-1, 0)
 
     # -------- ИИ --------
     def update_ai(self, dt):
@@ -1541,56 +1478,73 @@ class Game:
                 self.ai_diplomacy(f)
 
     def ai_military(self, f):
-        if not f.regions:
+        """ИИ на фронтах: набор в резерв, стойки Оборона/Атака по перевесу.
+
+        Тактика: агрессивные страны держат атаку дольше и чаще воюют с
+        нейтралами; осторожные сидят в обороне до явного превосходства."""
+        if not f.regions and f.reserve < 1:
             return
         p = f.personality or PERSONALITIES[1]
-        border = [r for r in f.regions if any(n.owner != f.fid for n in self.neighbors(r))]
-        if border and f.money >= 150 and f.manpower >= MANPOWER_PER_RECRUIT:
-            target = min(border, key=lambda r: r.forces.get(f.fid, 0))
-            self.recruit(target.rid, f.fid)
-        # развитие экономики и армии — в меру характера
+        # набор в резерв (с учётом людских ресурсов и казны)
+        cap_army = 26000 * (f.nation["army"] if f.nation else 1.0)
+        while (f.money >= RECRUIT_COST * 3 and f.manpower >= MANPOWER_PER_RECRUIT
+               and f.reserve < cap_army):
+            if not self.recruit(f.fid):
+                break
+        # развитие экономики — в меру характера
         if f.money >= ECON_DEV_COST * 3 and self.rng.random() < 0.35 * p["econ"]:
             owned = [r for r in f.regions if r.dev < MAX_ECON_DEV]
             if owned:
                 r = max(owned, key=lambda x: x.base_income)
                 self.develop_econ(r.rid, f.fid)
+        # технологии
         if f.money >= DEV_BASE_COST * 4 and self.rng.random() < 0.45 * p["tech"]:
-            self.develop_tech(f.fid, self.rng.choice(["atk", "atk", "atk", "def", "log", "mor"]))
-        # атаки: ИИ охотно бьёт по соседним провинциям, при силах можно бить
-        # в несколько сторон из одного региона; против игрока — осторожнее
-        for r in sorted(f.regions, key=lambda x: -x.forces.get(f.fid, 0)):
-            avail = r.forces.get(f.fid, 0)
-            if avail < 5000:
+            self.develop_tech(f.fid, self.rng.choice(
+                ["atk", "atk", "atk", "def", "log", "mor"]))
+        # стойки, распределение сил и оборона границ до войны
+        for fr in self.war_fronts.values():
+            if f.fid not in fr.troops:
                 continue
+            foe = fr.other(f.fid)
+            if foe == NEUTRAL:
+                fr.alloc[f.fid] = 0.25 * p["neutral"]
+                if not fr.line:
+                    continue
+                n = max(1, len(fr.line))
+                my_local = fr.troops[f.fid] / n
+                adv = my_local * self.attack_rate(f.fid) / max(1.0, NEUTRAL_GARRISON)
+                att = adv > 1.6 * p["neutral"] or (fr.stance[f.fid] == "att"
+                                                   and adv > 1.05)
+                fr.stance[f.fid] = "att" if att else "def"
+                continue
+            if self.at_war(f.fid, foe):
+                fr.alloc[f.fid] = 0.75
+                if not fr.line:
+                    continue
+                n = max(1, len(fr.line))
+                my_local = fr.troops[f.fid] / n
+                their_local = fr.troops[foe] / n
+                ratio = (my_local * self.attack_rate(f.fid, enemy_fid=foe)
+                         / max(1.0, their_local * self.front_def_rate(foe, f.fid)))
+                need = (1.12 + (1.0 - f.aggro) * 0.45) * p["need"]
+                # против игрока ИИ осторожнее
+                if foe == self.player:
+                    need += 0.35
+                att = ratio > need or (fr.stance[f.fid] == "att" and ratio > 0.9)
+                fr.stance[f.fid] = "att" if att else "def"
+        # заблаговременная оборона напряжённых границ (до войны)
+        for r in f.regions:
             for n in self.neighbors(r):
-                if n.owner == f.fid or self.allied(f.fid, n.owner):
+                if (n.owner == f.fid or n.owner == NEUTRAL
+                        or n.owner not in self.factions
+                        or self.at_war(f.fid, n.owner)):
                     continue
-                if n.owner == NEUTRAL:
-                    if avail < n.forces.get(NEUTRAL, 0.0) * 0.92 * p["neutral"]:
-                        continue
-                else:
-                    if not self.at_war(f.fid, n.owner) or self.has_nap(f.fid, n.owner):
-                        continue
-                    need = (0.92 + (1.0 - f.aggro) * 0.30) * p["need"]
-                    if n.owner == self.player:
-                        # против игрока нужен заметно больший перевес,
-                        # и атака решается не каждый момент
-                        need += 0.5
-                        if self.rng.random() < 0.35:
-                            continue
-                    if avail < n.forces.get(n.owner, 0.0) * need:
-                        continue
-                # не оголяем регион совсем: чем сильнее вражеские соседи, тем меньше бросаем
-                danger = sum(nb.forces.get(nb.owner, 0.0) for nb in self.neighbors(r)
-                             if nb.owner != f.fid and nb.owner != NEUTRAL
-                             and self.opposing(f.fid, nb.owner))
-                frac = 0.75 - 0.35 * min(1.0, danger / max(1.0, avail))
-                if frac < 0.25:
+                if f.relations.get(n.owner, 0) >= -15:
                     continue
-                self.send_move(r.rid, n.rid, f.fid, frac)
-                avail = r.forces.get(f.fid, 0)
-                if avail < 4000:
-                    break
+                fr = self.get_front(f.fid, n.owner)
+                fr.stance[f.fid] = "def"
+                fr.alloc[f.fid] = max(fr.alloc.get(f.fid, 0.3), 0.3)
+
 
     def can_offer_player(self):
         return (self.player is not None
@@ -1741,8 +1695,7 @@ class Game:
         if self.winner or self.choosing:
             return
         self.time += dt
-        self.update_moves(dt)
-        self.update_combat(dt)
+        self.update_fronts(dt)
         self.update_economy(dt)
         self.update_ai(dt)
         for r in self.regions:
@@ -1761,7 +1714,7 @@ class Game:
     def check_winner(self):
         alive = [f for f in self.factions.values() if f.alive]
         for f in alive:
-            if not f.regions and f.total_troops < 1:
+            if not f.regions:
                 f.alive = False
         alive = [f for f in self.factions.values() if f.alive]
         if self.player is not None:
@@ -2434,8 +2387,8 @@ def draw_topbar(screen, game, fonts):
     chip("Казна", f"{int(pf.money)}", WARN, 96)
     chip("Баланс", f"{net:+.1f}/с", GOOD if net >= 0 else BAD, 128)
     chip("Люди", fmt(pf.manpower), (120, 190, 255), 118)
-    chip("Регионы", str(len(pf.regions)), TEXT, 92)
-    chip("Войска", fmt(pf.total_troops), TEXT, 122)
+    chip("Армия", fmt(pf.total_troops), TEXT, 122)
+    chip("Резерв", fmt(pf.reserve), (200, 170, 110), 122)
     chip("Мораль", f"{int(pf.morale)}", GOOD if pf.morale > 70 else WARN, 96)
 
     draw_button(screen, f_chip, BTN_PAUSE, "ПРОДОЛЖИТЬ" if game.paused else "ПАУЗА",
@@ -2467,132 +2420,6 @@ def draw_map(screen, game, fonts):
                             [(px - MAP_X, py - MAP_Y) for px, py in region_poly(r.x, r.y)])
     screen.blit(fills, (MAP_X, MAP_Y))
 
-    # ---- «жидкая» граница войны: видна НА ВСЁМ фронте -------------------
-    # Для каждого ребра между воюющими провинциями берём давление (долю
-    # сил противника в провинции), сглаживаем его во времени и гауссовым
-    # ядром вдоль всей линии фронта (соседние линии ступенчатых фронтов
-    # подмешиваются слабее). Полоса противника рисуется С ОБЕИХ СТОРОН
-    # каждого ребра: весь фронт покрыт органичной «жидкой» линией, её
-    # глубина растёт там, где войска реально давят и захватывают.
-    banded = set()
-
-    def pair_press(tile, foe_fid):
-        """Доля сил foe_fid в tile против сил владельца (0..1)."""
-        own = tile.forces.get(tile.owner, 0.0)
-        foe = tile.forces.get(foe_fid, 0.0)
-        tot = own + foe
-        return min(1.0, foe / tot) if tot > 0.5 else 0.0
-
-    def draw_band(tile, foe_col, d, cov):
-        """Мягкая полоса цвета foe_col в tile со стороны d.
-
-        Без обводки: граница — это просто органичный стык двух цветов,
-        как на референсе. Прозрачность растёт с глубиной захвата, у тонкой
-        «линии войны» полоса едва заметна."""
-        b = region_bbox(tile.x, tile.y)
-        ox, oy = MAP_X + tile.x * TILE, MAP_Y + tile.y * TILE
-        pts = split_line(d, cov, tile.x, tile.y)
-        surf = pygame.Surface((b.w, b.h), pygame.SRCALPHA)
-        band = [(px + ox - b.x, py + oy - b.y) for px, py in band_poly(d, pts)]
-        a = int(80 + 110 * max(0.0, min(1.0, (cov - FLOOR) / 0.40)))
-        pygame.draw.polygon(surf, foe_col + (a,), band)
-        surf.blit(region_mask(tile.x, tile.y), (0, 0),
-                  special_flags=pygame.BLEND_RGBA_MULT)
-        screen.blit(surf, (b.x, b.y))
-        banded.add(tile.rid)
-
-    # давление на каждом ребре войны (+ плавное течение во времени)
-    epc = getattr(game, "_edge_press", None)
-    if epc is None:
-        epc = game._edge_press = {}
-    raw = {}
-    seen_edges = set()
-    for r in game.regions:
-        for n in game.neighbors(r):
-            ek = (min(r.rid, n.rid), max(r.rid, n.rid))
-            if ek in seen_edges:
-                continue
-            war = game.at_war(r.owner, n.owner)
-            if not war:
-                # оккупация без войны (войска застряли после мира) —
-                # полоса нужна, если чужие силы реально стоят в провинции
-                if pair_press(r, n.owner) <= 0.02 and pair_press(n, r.owner) <= 0.02:
-                    continue
-            seen_edges.add(ek)
-            pair = (min(r.owner, n.owner), max(r.owner, n.owner))
-            if n.y == r.y:                       # граница вертикальная
-                axis, line = "v", max(r.x, n.x)
-                u = r.y + 0.5
-                west, east = (r, n) if r.x < n.x else (n, r)
-                pw = pair_press(west, east.owner)     # восток давит в запад
-                pe = pair_press(east, west.owner)     # запад давит в восток
-            else:                                # граница горизонтальная
-                axis, line = "h", max(r.y, n.y)
-                u = r.x + 0.5
-                north, south = (r, n) if r.y < n.y else (n, r)
-                pw = pair_press(north, south.owner)   # юг давит в север
-                pe = pair_press(south, north.owner)   # север давит в юг
-            old = epc.get(ek)
-            if old is None:
-                epc[ek] = (pw, pe)
-            else:
-                epc[ek] = (old[0] + (pw - old[0]) * 0.10,
-                           old[1] + (pe - old[1]) * 0.10)
-            pw, pe = epc[ek]
-            raw.setdefault((axis, line, pair), []).append(
-                (u, pw, pe, r, n, war))
-
-    # гауссово поле давления вдоль всей линии фронта
-    front = {}
-    for key, samples in raw.items():
-        axis, line, pair = key
-        ws = [(u, w, 1.0) for (u, w, e, r, n, war) in samples]
-        es = [(u, e, 1.0) for (u, w, e, r, n, war) in samples]
-        for dl in (-1, 1):
-            for (u2, w2, e2, r2, n2, wm) in raw.get((axis, line + dl, pair), ()):
-                ws.append((u2, w2, 0.35))
-                es.append((u2, e2, 0.35))
-        front[key] = (ws, es)
-
-    def field_at(samples, u):
-        if not samples:
-            return 0.0
-        sigma = 1.25 * TILE
-        num = den = 0.0
-        for (c, f, w) in samples:
-            wg = w * math.exp(-((u - c * TILE) ** 2) / (2.0 * sigma * sigma))
-            num += f * wg
-            den += wg
-        return num / den if den > 1e-9 else 0.0
-
-    FLOOR = 0.10         # базовая «линия войны» — видна на всём фронте
-    for key, samples in raw.items():
-        axis, line, pair = key
-        fw, fe = front[key]
-        for (u, pw, pe, r, n, war) in samples:
-            if axis == "v":
-                west, east = (r, n) if r.x < n.x else (n, r)
-                cov_w = field_at(fw, u)
-                cov_e = field_at(fe, u)
-                if war:      # на войне фронт виден везде — базовая линия
-                    cov_w = FLOOR + (1.0 - FLOOR) * cov_w
-                    cov_e = FLOOR + (1.0 - FLOOR) * cov_e
-                elif cov_w < 0.045 and cov_e < 0.045:
-                    continue
-                draw_band(west, faction_color(game, east.owner), (1, 0), cov_w)
-                draw_band(east, faction_color(game, west.owner), (-1, 0), cov_e)
-            else:
-                north, south = (r, n) if r.y < n.y else (n, r)
-                cov_n = field_at(fw, u)
-                cov_s = field_at(fe, u)
-                if war:
-                    cov_n = FLOOR + (1.0 - FLOOR) * cov_n
-                    cov_s = FLOOR + (1.0 - FLOOR) * cov_s
-                elif cov_n < 0.045 and cov_s < 0.045:
-                    continue
-                draw_band(north, faction_color(game, south.owner), (0, 1), cov_n)
-                draw_band(south, faction_color(game, north.owner), (0, -1), cov_s)
-
     # ---- проход 2: тонкие внутренние линии (как на примере) ----
     ls = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
     for r in game.regions:
@@ -2622,94 +2449,6 @@ def draw_map(screen, game, fonts):
             if hot:
                 pygame.draw.lines(fx, (255, 190, 120, 60), False, mp, 1)
     screen.blit(fx, (MAP_X, MAP_Y))
-
-    # ---- проход 4.5: окружения (котлы) ---------------------------------
-    # Группа регионов, отрезанная от основной территории своей страны, —
-    # котёл: слегка затемняется и обводится пульсирующим кольцом цвета
-    # окружителя. Прорвавшиеся в тыл войска (бой в провинции, вокруг
-    # которой нет связной земли армии-захватчика) — тоже котёл: фронт
-    # читается целиком, а глубокий клин выглядит как окружение.
-    pockets = []
-    main_body = {}
-    for fid, f in game.factions.items():
-        if not f.alive:
-            continue
-        own = {r.rid for r in f.regions}
-        if not own:
-            continue
-        # связные компоненты земель страны; крупнейшая — основная территория
-        comps = []
-        left = set(own)
-        while left:
-            seed = next(iter(left))
-            grp = {seed}
-            stack = [seed]
-            left.discard(seed)
-            while stack:
-                cur = stack.pop()
-                for nb in game.neighbors(game.regions[cur]):
-                    if nb.owner == fid and nb.rid in left:
-                        left.discard(nb.rid)
-                        grp.add(nb.rid)
-                        stack.append(nb.rid)
-            comps.append(grp)
-        comps.sort(key=len, reverse=True)
-        main_body[fid] = comps[0]
-        for grp in comps[1:]:
-            cnt = {}
-            for rid in grp:
-                for nb in game.neighbors(game.regions[rid]):
-                    if nb.rid not in grp and game.at_war(fid, nb.owner):
-                        cnt[nb.owner] = cnt.get(nb.owner, 0) + 1
-            if cnt:
-                pockets.append((grp, max(cnt, key=cnt.get)))
-    # войска, прорвавшиеся глубже фронта: воюют в провинции, вокруг
-    # которой нет связной земли их стороны — они в котле
-    for r in game.regions:
-        for f2, v in r.forces.items():
-            if v <= 200 or f2 == r.owner or f2 == NEUTRAL:
-                continue
-            if f2 not in game.factions or not game.at_war(f2, r.owner):
-                continue
-            if r.rid in main_body.get(f2, ()):
-                continue
-            if any(nb.rid in main_body.get(f2, ()) for nb in game.neighbors(r)):
-                continue
-            pockets.append(({r.rid}, r.owner))
-
-    for grp, besieger in pockets:
-        col = faction_color(game, besieger)
-        # лёгкое затемнение котла
-        for rid in grp:
-            r = game.regions[rid]
-            m = region_mask(r.x, r.y).copy()
-            m.fill((16, 12, 10, 60), special_flags=pygame.BLEND_RGBA_MULT)
-            b = region_bbox(r.x, r.y)
-            screen.blit(m, (b.x, b.y))
-        # пульсирующее кольцо по внешним рёбрам котла (внутренние границы
-        # между регионами котла не обводятся — кольцо одно, вокруг всего)
-        pulse = 0.55 + 0.45 * math.sin(game.time * 2.6)
-        ring = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
-        for rid in grp:
-            r = game.regions[rid]
-            x, y = r.x, r.y
-            sides = []
-            if y == 0 or game.region_at(x, y - 1).rid not in grp:
-                sides.append(edge_pts('h', x, y))
-            if y == GRID - 1 or game.region_at(x, y + 1).rid not in grp:
-                sides.append(edge_pts('h', x, y + 1))
-            if x == 0 or game.region_at(x - 1, y).rid not in grp:
-                sides.append(edge_pts('v', x, y))
-            if x == GRID - 1 or game.region_at(x + 1, y).rid not in grp:
-                sides.append(edge_pts('v', x + 1, y))
-            for pts in sides:
-                mp = [(px - MAP_X, py - MAP_Y) for px, py in pts]
-                pygame.draw.lines(ring, col + (int(60 * pulse),), False, mp, 7)
-                pygame.draw.lines(ring, col + (int(150 + 80 * pulse),),
-                                  False, mp, 3)
-                pygame.draw.lines(ring, (255, 250, 235, int(55 * pulse)),
-                                  False, mp, 1)
-        screen.blit(ring, (MAP_X, MAP_Y))
 
     # ---- проход 6: вспышки боя ----
     for r in game.regions:
@@ -2762,164 +2501,84 @@ def draw_map(screen, game, fonts):
             pygame.draw.polygon(screen, mix(col, (255, 255, 255), 0.55),
                                 poly, max(1, int(3 * pulse)))
 
-    # ---- проход 7: столицы, числа, сопротивление, выделение ----
+    # ---- проход 4.6: фронты — плавная линия, бои, числа войск ------------
+    def _front_draw_pts(fr, subs=6):
+        """Плотная полилиния фронта с учётом локальных смещений push."""
+        pts = []
+        L = fr.line
+        for i in range(len(L) - 1):
+            x1, y1, nx1, ny1 = L[i][0], L[i][1], L[i][2], L[i][3]
+            x2, y2, nx2, ny2 = L[i + 1][0], L[i + 1][1], L[i + 1][2], L[i + 1][3]
+            p1, p2 = fr.push[i], fr.push[i + 1]
+            for k in range(subs):
+                t = k / subs
+                mt = 1.0 - t
+                u = mt * x1 + t * x2 + (mt * nx1 + t * nx2) * (mt * p1 + t * p2)
+                v = mt * y1 + t * y2 + (mt * ny1 + t * ny2) * (mt * p1 + t * p2)
+                pts.append((u, v))
+        e = L[-1]
+        pts.append((e[0] + e[2] * fr.push[-1], e[1] + e[3] * fr.push[-1]))
+        return pts
+
+    for fr in game.war_fronts.values():
+        if not fr.line or len(fr.line) < 2:
+            continue
+        fa = game.factions.get(fr.a)
+        fb = game.factions.get(fr.b)
+        col_a = fa.color if fa is not None else NEUTRAL_COL
+        col_b = fb.color if fb is not None else NEUTRAL_COL
+        hot = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
+        base = [(px - MAP_X, py - MAP_Y) for px, py in _front_draw_pts(fr)]
+        pygame.draw.lines(hot, (255, 205, 130, 95), False, base, 3)
+        # участки боёв: яркая пульсирующая линия
+        for btl in fr.battles:
+            seg = base[btl["i0"] * 6:(btl["i1"] - 1) * 6 + 1]
+            if len(seg) < 2:
+                continue
+            pl = 0.6 + 0.4 * math.sin(game.time * 6.0)
+            pygame.draw.lines(hot, (255, 240, 180, int(120 + 100 * pl)),
+                              False, seg, 7)
+            pygame.draw.lines(hot, (255, 250, 230, int(130 + 110 * pl)),
+                              False, seg, 3)
+        screen.blit(hot, (MAP_X, MAP_Y))
+        # маркер боя — искры в центре участка
+        for btl in fr.battles:
+            seg = base[btl["i0"] * 6:(btl["i1"] - 1) * 6 + 1]
+            if seg:
+                mx = sum(p[0] for p in seg) / len(seg) + MAP_X
+                my = sum(p[1] for p in seg) / len(seg) + MAP_Y
+                draw_clash(screen, mx, my)
+        # числа войск: по обе стороны линии, у средней точки
+        total = fr.troops.get(fr.a, 0) + fr.troops.get(fr.b, 0)
+        if total < 400 or len(fr.line) < 2:
+            continue
+        mid = fr.line[len(fr.line) // 2]
+        cx, cy, nx, ny = mid[0], mid[1], mid[2], mid[3]
+        off = TILE * 0.42
+        img_a = render_outline(f_small, front_troops_text(fr.troops.get(fr.a, 0)),
+                               fill=col_a)
+        img_b = render_outline(f_small, front_troops_text(fr.troops.get(fr.b, 0)),
+                               fill=col_b)
+        pa = [MAP_X + cx + nx * off, MAP_Y + cy + ny * off]
+        pb = [MAP_X + cx - nx * off, MAP_Y + cy - ny * off]
+        # подписи не выходят за карту
+        for pnt in (pa, pb):
+            pnt[0] = max(MAP_X + 22, min(MAP_X + MAP_W - 22, pnt[0]))
+            pnt[1] = max(MAP_Y + 10, min(MAP_Y + MAP_H - 10, pnt[1]))
+        screen.blit(img_a, (pa[0] - img_a.get_width() / 2,
+                            pa[1] - img_a.get_height() / 2))
+        screen.blit(img_b, (pb[0] - img_b.get_width() / 2,
+                            pb[1] - img_b.get_height() / 2))
+
+    # ---- проход 7: столицы и выделение ----
     for r in game.regions:
         x = MAP_X + r.x * TILE
         y = MAP_Y + r.y * TILE
         if r.capital_of is not None and r.capital_of == r.owner:
             draw_flag(screen, x + TILE - 26, y + 6, 14,
                       game.factions.get(r.owner))
-        owner_share, inv_fid, inv_share = game.control(r)
-        if r.rid not in banded:
-            present = [(v, f) for f, v in r.forces.items() if v > 0.5]
-            # цифры войск — только у выбранного региона и его соседей (G — все)
-            if game.show_numbers or r.rid == sel or r.rid in neighbor_ids:
-                present.sort(key=lambda t: (t[1] != r.owner, -t[0]))
-                sz = f_small if r.rid == sel else f_tiny
-                v = present[0][0] if present else 0
-                f = present[0][1] if present else r.owner
-                rr = counter_rect(sz, x + TILE // 2, y + TILE // 2, v)
-                draw_counter_rect(screen, sz, rr, faction_color(game, f), v)
-        if inv_fid is not None and 0.03 < inv_share < 0.985:
-            txt = f"{int(round(inv_share * 100))}%"
-            pc = f_tiny.render(txt, True, (255, 236, 170))
-            psh = f_tiny.render(txt, True, (20, 15, 0))
-            d = game.attack_dir(r, inv_fid)
-            left_side = (d == (1, 0))
-            top_side = (d != (0, -1))
-            px = x + 4 if left_side else x + TILE - pc.get_width() - 4
-            py = y + 4 if top_side else y + TILE - pc.get_height() - 7
-            screen.blit(psh, (px + 1, py + 1))
-            screen.blit(pc, (px, py))
         if sel == r.rid:
             pygame.draw.polygon(screen, (255, 236, 120), region_poly(r.x, r.y), 3)
-        elif r.rid in move_targets:
-            pygame.draw.polygon(screen, (255, 180, 60), region_poly(r.x, r.y), 2)
-
-    # ---- проход 8: численность войск вдоль крупных фронтов ----
-    # гарнизон приграничья (2 клетки) каждой стороны; у страны с двумя врагами
-    # — по числу на каждого. Числа ТОЛЬКО у пар стран, которые воюют между
-    # собой: мирные границы и стычки чужих армий в проходе чисел не получают.
-    # Идеал читаемости: число горизонтально, стоит на «своём» участке границы
-    # и отступлено вглубь своей территории; изгиб вдоль пути — только для
-    # длинных плавных горизонтальных фронтов
-    labels = []
-    for fr in game.fronts():
-        fid_a, fid_b = fr["pair"]
-        va, vb = fr["troops"][fid_a], fr["troops"][fid_b]
-        if (va < 1 and vb < 1) or va + vb < 4000:
-            continue
-        if not game.at_war(fid_a, fid_b):
-            continue
-        labels.append((va + vb, front_troops_text(va), front_troops_text(vb), fr))
-    placed = []
-    map_rect = R(MAP_X + 4, MAP_Y + 4, MAP_W - 8, MAP_H - 8)
-    for _, ta, tb, fr in sorted(labels, key=lambda t: -t[0]):
-        pts = fr["path"]
-        if len(pts) < 2 or fr["pos"] is None:
-            continue
-        p0, p1 = pts[0], pts[-1]
-        vx, vy = p1[0] - p0[0], p1[1] - p0[1]
-        pa = fr["pos"].get(fr["pair"][0])
-        cross = vx * (pa[0] - p0[0]) - vy * (pa[1] - p0[1]) if pa else 0.0
-        side_a = 1 if cross > 0 else -1
-        scr = [(MAP_X + (p[0] + 0.5) * TILE, MAP_Y + (p[1] + 0.5) * TILE)
-               for p in pts]
-        plen = sum(math.hypot(scr[i + 1][0] - scr[i][0], scr[i + 1][1] - scr[i][1])
-                   for i in range(len(scr) - 1))
-        horizontal = abs(vx) >= abs(vy) * 1.4
-        enough = plen > (len(ta) + len(tb)) * 17
-        if horizontal and enough:
-            ok_a = _text_along_path(screen, f_front, ta, pts, 30, side=side_a,
-                                    anchor="start", placed_rects=placed)
-            ok_b = _text_along_path(screen, f_front, tb, pts, 30, side=-side_a,
-                                    anchor="end", placed_rects=placed)
-            if ok_a and ok_b:
-                continue
-        # горизонтальные числа: точка пути на «своём» участке, отступ вглубь
-        for fid, txt in ((fr["pair"][0], ta), (fr["pair"][1], tb)):
-            pp = fr["pos"].get(fid)
-            if pp is None:
-                continue
-            cs = (MAP_X + (pp[0] + 0.5) * TILE, MAP_Y + (pp[1] + 0.5) * TILE)
-            img = render_outline(f_front, txt)
-            my_side = side_a if fid == fr["pair"][0] else -side_a
-            # точки пути со стороны этой страны
-            own = []
-            for i in range(1, len(scr)):
-                a_, b_ = scr[i - 1], scr[i]
-                c2 = (b_[0] - a_[0]) * (cs[1] - a_[1]) - (b_[1] - a_[1]) * (cs[0] - a_[0])
-                own.append((i, c2 * my_side >= 0))
-            idxs = [i for i, is_own in own if is_own] or list(range(1, len(scr)))
-            # кандидаты: середина, четверти, края — ближайшие к центру своего участка
-            mid = idxs[len(idxs) // 2]
-            order = [mid] + sorted(set(idxs) - {mid},
-                                   key=lambda i: abs(i - mid))[:len(idxs)]
-            best = None
-            for i in order:
-                p = scr[min(i, len(scr) - 1)]
-                dx, dy = cs[0] - p[0], cs[1] - p[1]
-                d = math.hypot(dx, dy) or 1.0
-                bx = p[0] + dx / d * 0.52 * TILE
-                by = p[1] + dy / d * 0.52 * TILE
-                rect = pygame.Rect(int(bx - img.get_width() / 2),
-                                   int(by - img.get_height() / 2),
-                                   img.get_width(), img.get_height())
-                rect.clamp_ip(map_rect)
-                if not any(rect.inflate(10, 10).colliderect(r) for r in placed):
-                    best = rect
-                    break
-            if best is None:
-                best = pygame.Rect(int(cs[0] - img.get_width() / 2),
-                                   int(cs[1] - img.get_height() / 2),
-                                   img.get_width(), img.get_height())
-                best.clamp_ip(map_rect)
-                if any(best.inflate(10, 10).colliderect(r) for r in placed):
-                    continue
-            placed.append(best.inflate(6, 6))
-            screen.blit(img, best.topleft)
-
-    # ---- движущиеся армии ----
-    if game.moves:
-        clash_off = {}
-        for m1, m2 in getattr(game, "field_clashes", []):
-            clash_off[id(m1)] = 1
-            clash_off[id(m2)] = -1
-        trail = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
-        for m in game.moves:
-            a = game.regions[m.src]
-            b = game.regions[m.dst]
-            ax = a.x * TILE + TILE / 2
-            ay = a.y * TILE + TILE / 2
-            bx = b.x * TILE + TILE / 2
-            by = b.y * TILE + TILE / 2
-            frac = 0.5 if m.frozen else 1.0
-            ex = ax + (bx - ax) * frac
-            ey = ay + (by - ay) * frac
-            pygame.draw.line(trail, faction_color(game, m.fid) + (110,),
-                             (ax, ay), (ex, ey), 3)
-        screen.blit(trail, (MAP_X, MAP_Y))
-        for m in game.moves:
-            a = game.regions[m.src]
-            b = game.regions[m.dst]
-            ax = MAP_X + a.x * TILE + TILE / 2
-            ay = MAP_Y + a.y * TILE + TILE / 2
-            bx = MAP_X + b.x * TILE + TILE / 2
-            by = MAP_Y + b.y * TILE + TILE / 2
-            t = 0.5 if m.frozen else m.progress
-            px = ax + (bx - ax) * t
-            py = ay + (by - ay) * t
-            if m.frozen:
-                dx, dy = bx - ax, by - ay
-                length = math.hypot(dx, dy) or 1.0
-                sign = clash_off.get(id(m), 1)
-                px += -dy / length * 15 * sign
-                py += dx / length * 15 * sign
-                draw_clash(screen, ax + (bx - ax) * 0.5, ay + (by - ay) * 0.5)
-            col = faction_color(game, m.fid)
-            rect = counter_rect(f_tiny, px, py, m.amount)
-            rect.clamp_ip(R(MAP_X + 2, MAP_Y + 2, MAP_W - 4, MAP_H - 4))
-            draw_counter_rect(screen, f_tiny, rect, col, m.amount)
 
     # ---- проход 9: названия стран на их территориях ----
     if game.show_names:
@@ -3115,9 +2774,15 @@ def draw_overview_tab(screen, game, fonts):
         screen.blit(f_tiny.render(f"{cost}", True, MUTED), (br.right - 26, br.y + 10))
     y4b = yb + 40
 
+    # набор в резерв: солдаты резерва разворачиваются на фронты сами
+    br_res = R(PANEL_X + 10, yb + 40, PANEL_W - 20, 36)
+    can_recruit = pf.money >= RECRUIT_COST and pf.manpower >= MANPOWER_PER_RECRUIT
+    draw_button(screen, f_chip, br_res,
+                f"НАБРАТЬ В РЕЗЕРВ +{fmt(RECRUIT_AMOUNT)} ({RECRUIT_COST})   ·   резерв: {fmt(pf.reserve)}",
+                (55, 150, 90), disabled=not can_recruit)
     # уровень призыва: больше людских ресурсов, но меньше дохода
     ci = CONSCRIPT[pf.conscript]
-    br2 = R(PANEL_X + 10, y4b + 2, PANEL_W - 20, 36)
+    br2 = R(PANEL_X + 10, yb + 80, PANEL_W - 20, 36)
     if pf.conscript < len(CONSCRIPT) - 1:
         ccost = game.conscript_cost(pf.fid)
         nxt = CONSCRIPT[pf.conscript + 1]
@@ -3129,7 +2794,7 @@ def draw_overview_tab(screen, game, fonts):
                     (60, 64, 74), disabled=True)
 
     # журнал
-    y5 = y4b + 50
+    y5 = yb + 124
     screen.blit(f_head.render("Журнал", True, TEXT), (PANEL_X + 16, y5))
     lr = R(PANEL_X + 10, y5 + 26, PANEL_W - 20, H - 24 - (y5 + 26))
     draw_card(screen, lr, (31, 35, 43), BORDER, 9, 1)
@@ -3150,52 +2815,29 @@ def draw_region_tab(screen, game, fonts):
     r = game.regions[game.selected]
     own = ("ваш" if r.owner == game.player else
            ("независимый" if r.owner == NEUTRAL else game.factions[r.owner].name))
-    rr = R(PANEL_X + 10, CONTENT_Y, PANEL_W - 20, 150)
+    rr = R(PANEL_X + 10, CONTENT_Y, PANEL_W - 20, 110)
     draw_card(screen, rr, CARD, BORDER, 9, 1)
     pygame.draw.rect(screen, faction_color(game, r.owner), (rr.x, rr.y, 6, rr.h),
                      border_top_left_radius=9, border_bottom_left_radius=9)
     screen.blit(f_head.render(f"({r.x},{r.y})  {r.terrain[0]}", True, TEXT), (rr.x + 16, rr.y + 8))
     screen.blit(f_small.render(f"владелец: {own}", True, MUTED), (rr.x + 16, rr.y + 34))
     screen.blit(f_small.render(
-        f"Гарнизон {fmt(r.owner_forces())}   Доход {r.income:.2f}/с   Развитие {r.dev}/{MAX_ECON_DEV}",
+        f"Доход {r.income:.2f}/с   Развитие {r.dev}/{MAX_ECON_DEV}   Население {fmt(r.pop)}",
         True, TEXT), (rr.x + 16, rr.y + 54))
-    screen.blit(f_small.render(f"Население {fmt(r.pop)}", True, TEXT),
-                (rr.x + 16, rr.y + 74))
-
-    # бой
-    fids = [f for f, v in r.forces.items() if v > 0.5]
-    if len(fids) > 1:
-        screen.blit(f_head.render("Бой за регион", True, (255, 170, 120)), (rr.x + 16, rr.y + 100))
-        info = game.battle_preview(r)
-        order = sorted(info.items(), key=lambda kv: -kv[1]["troops"])
-        bx = rr.x + 150
-        for i, (fid, d) in enumerate(order[:2]):
-            by = rr.y + 100 + i * 22
-            col = faction_color(game, fid)
-            name = "независ." if fid == NEUTRAL else game.factions[fid].name
-            role = "оборона" if d["owner"] else "атака"
-            pygame.draw.rect(screen, col, (bx, by + 3, 10, 10), border_radius=2)
-            screen.blit(f_small.render(f"{name[:15]}", True, TEXT), (bx + 16, by))
-            screen.blit(f_small.render(f"{fmt(d['troops'])}", True, TEXT), (bx + 190, by))
-            screen.blit(f_small.render(f"-{d['taken']:.0f}/с", True, BAD), (bx + 300, by))
-            screen.blit(f_small.render(role, True, MUTED), (bx + 380, by))
+    screen.blit(f_small.render(
+        "Войска стоят в резерве и на фронтах — в провинциях их нет.",
+        True, MUTED), (rr.x + 16, rr.y + 78))
 
     # действия — только для игрока; наблюдатель смотрит без кнопок
-    if game.player is not None:
-        ay = CONTENT_Y + 162
-        can = r.owner == game.player
+    if game.player is not None and r.owner == game.player:
+        ay = CONTENT_Y + 122
         cost_dev = ECON_DEV_COST * (r.dev + 1)
-        draw_button(screen, f_chip, R(PANEL_X + 10, ay, 292, 42), f"НАБРАТЬ ({RECRUIT_COST})",
-                    (55, 150, 90), disabled=not (can and pf.money >= RECRUIT_COST
-                                                 and pf.manpower >= MANPOWER_PER_RECRUIT))
-        draw_button(screen, f_chip, R(PANEL_X + 314, ay, 292, 42), "ДВИНУТЬ (ПКМ)",
-                    (60, 120, 200), active=game.move_mode, disabled=not can)
-        draw_button(screen, f_chip, R(PANEL_X + 10, ay + 50, PANEL_W - 20, 42),
+        draw_button(screen, f_chip, R(PANEL_X + 10, ay, PANEL_W - 20, 42),
                     f"РАЗВИТЬ ЭКОНОМИКУ ({cost_dev})   +{int(r.dev*ECON_DEV_INCOME*100)}% → +{int((r.dev+1)*ECON_DEV_INCOME*100)}%",
-                    (95, 85, 175), disabled=not (can and r.dev < MAX_ECON_DEV and pf.money >= cost_dev))
+                    (95, 85, 175), disabled=r.dev >= MAX_ECON_DEV or pf.money < cost_dev)
 
     # соседние регионы
-    ny = CONTENT_Y + 292
+    ny = CONTENT_Y + 182
     screen.blit(f_head.render("Соседние регионы", True, TEXT), (PANEL_X + 16, ny - 26))
     mx, my = map_mouse(pygame.mouse.get_pos(), pygame.display.get_surface().get_size())
     oy = getattr(game, "panel_scroll", {}).get(1, 0)     # мышь в системе прокрутки
@@ -3208,7 +2850,6 @@ def draw_region_tab(screen, game, fonts):
         owner = ("ваш" if n.owner == game.player else
                  ("независ." if n.owner == NEUTRAL else game.factions[n.owner].name))
         screen.blit(f_small.render(f"({n.x},{n.y}) {n.terrain[0]}", True, TEXT), (nr.x + 22, nr.y + 7))
-        screen.blit(f_small.render(f"{fmt(n.owner_forces())}", True, TEXT), (nr.x + 250, nr.y + 7))
         tag = ""
         tcol = MUTED
         if n.owner != NEUTRAL and n.owner != game.player:
@@ -3313,45 +2954,70 @@ def draw_wars_tab(screen, game, fonts):
         sx += 124
     y += 32
 
-    # строки войн: у игрока — свои войны, у наблюдателя — все пары
-    rows = []
-    for f in game.factions.values():
-        if not observer and f.fid != pf.fid:
-            continue
-        for w in f.wars:
-            rows.append((f, w))
-    # дедупликация: пара (a,b) и (b,a) — одна война; показываем запись стороны a
-    seen = set()
-    uniq = []
-    for f, w in rows:
-        pair = tuple(sorted((f.fid, w["fid"])))
-        if pair in seen:
-            continue
-        seen.add(pair)
-        uniq.append((f, w))
-    rows = uniq
-
-    def sort_key(item):
-        f, w = item
-        if sort == "losses":
-            return -(w["losses"] + w["kills"])
-        if sort == "kills":
-            return -(w["kills"] - w["losses"])
-        return -w["start"]
-
-    rows.sort(key=sort_key)
+    # строки: войны, экспансия, границы до войны; доля армии и стойки
+    rows = game.war_rows()
+    rh = 44
     if not rows:
         screen.blit(f_body.render("Войн пока не было — тишь и гладь.", True, MUTED),
                     (PANEL_X + 16, y + 8))
         return
 
-    # сводная статистика фракций
-    stats = sorted(game.factions.values(),
-                   key=lambda f: -(f.kills if observer else 0)) if observer else []
-    rh = 44
-    for f, w in rows[:12]:
+    pf = game.factions[game.player] if not observer else None
+
+    def draw_alloc(cr, fr):
+        """Доля армии на фронте: «−» процент «+»."""
+        alloc = fr.alloc.get(game.player, 0.5) if fr is not None else 0.3
+        bx = cr.right - 344
+        draw_button(screen, f_small, R(bx, cr.y + 16, 28, 26), "−",
+                    (70, 100, 130))
+        draw_button(screen, f_small, R(bx + 34, cr.y + 16, 28, 26), "+",
+                    (70, 100, 130))
+        screen.blit(f_small.render(f"{int(round(alloc * 100))}%", True, TEXT),
+                    (bx + 70, cr.y + 20))
+
+    def draw_stances(cr, st):
+        for j, stv in enumerate(("def", "att")):
+            br = R(cr.right - 180 + j * 88, cr.y + 14, 82, 30)
+            draw_button(screen, f_tiny, br,
+                        "ОБОРОНА" if stv == "def" else "АТАКА",
+                        (70, 110, 160) if stv == "def" else (170, 110, 70),
+                        active=(st == stv))
+
+    for row in rows[:12]:
+        if row["kind"] == "neutral":
+            fr = row["front"]
+            cr = R(PANEL_X + 10, y, PANEL_W - 20, 44)
+            draw_card(screen, cr, (30, 34, 42), BORDER, 8, 1)
+            screen.blit(f_small.render("Экспансия: независимые провинции",
+                                       True, TEXT), (cr.x + 12, cr.y + 6))
+            my_t = fr.troops.get(game.player, 0)
+            screen.blit(f_tiny.render(f"на фронте: {fmt(my_t)}", True, MUTED),
+                        (cr.x + 12, cr.y + 25))
+            draw_alloc(cr, fr)
+            draw_stances(cr, fr.stance.get(game.player, "def"))
+            y += row["h"]
+            continue
+        if row["kind"] == "pre_war":
+            foe = game.factions.get(row["foe"])
+            fr = row["front"]
+            cr = R(PANEL_X + 10, y, PANEL_W - 20, 44)
+            draw_card(screen, cr, (30, 34, 42), BORDER, 8, 1)
+            pygame.draw.rect(screen, foe.color, (cr.x + 8, cr.y + 8, 5, rh - 16),
+                             border_radius=2)
+            screen.blit(f_small.render(f"Граница с «{foe.name}» — мир",
+                                       True, MUTED), (cr.x + 26, cr.y + 6))
+            my_t = fr.troops.get(game.player, 0) if fr is not None else 0
+            screen.blit(f_tiny.render(
+                f"прикрытие: {fmt(my_t)}   ·   АТАКА = объявить войну",
+                True, MUTED), (cr.x + 26, cr.y + 25))
+            draw_alloc(cr, fr)
+            draw_stances(cr, fr.stance.get(game.player, "def") if fr is not None
+                          else "def")
+            y += row["h"]
+            continue
+        f, w = row["f"], row["w"]
         other = game.factions.get(w["fid"])
-        cr = R(PANEL_X + 10, y, PANEL_W - 20, rh)
+        cr = R(PANEL_X + 10, y, PANEL_W - 20, 44)
         active = w["end"] is None
         draw_card(screen, cr, CARD if active else (28, 30, 36), BORDER, 8, 1)
         pygame.draw.rect(screen, f.color, (cr.x + 8, cr.y + 8, 5, rh - 16), border_radius=2)
@@ -3363,13 +3029,23 @@ def draw_wars_tab(screen, game, fonts):
         state = "ИДЁТ" if active else f"{mins} мин"
         screen.blit(f_tiny.render(state, True, BAD if active else MUTED),
                     (cr.right - 60, cr.y + 6))
-        # потери сторон: у f — w['losses'] (свои), w['kills'] — нанесённые
-        a_loss = f.losses if not active else f.losses
+        fr = row.get("front")
+        front_txt = ""
+        if fr is not None and fr.line:
+            my_t = fr.troops.get(f.fid, 0)
+            their_t = fr.troops.get(w["fid"], 0)
+            n_b = len(fr.battles)
+            front_txt = (f"фронт: {fmt(my_t)} ⚔ {fmt(their_t)}"
+                         + (f"   ·   боёв: {n_b}" if n_b else ""))
         line2 = (f"потери {fmt(w['losses'])}   ·   нанесено {fmt(w['kills'])}"
-                 f"   ·   доктрины: {DOCTRINES[f.doctrine]['name']} / "
-                 f"{DOCTRINES[other.doctrine]['name'] if other else '—'}")
-        screen.blit(f_tiny.render(line2, True, MUTED), (cr.x + 26, cr.y + 24))
-        y += rh + 6
+                 + (f"   ·   {front_txt}" if front_txt else ""))
+        screen.blit(f_tiny.render(clip_text(f_tiny, line2, cr.w - 200), True, MUTED),
+                    (cr.x + 26, cr.y + 24))
+        if active and not observer:
+            draw_alloc(cr, fr)
+            draw_stances(cr, fr.stance.get(f.fid, "def") if fr is not None
+                          else "def")
+        y += row["h"]
 
     # глобальная таблица потерь
     y += 8
@@ -3555,7 +3231,7 @@ def draw_bottom(screen, game, fonts):
     card = R(MAP_X, y, MAP_W, H - y - 14)
     draw_card(screen, card, PANEL, BORDER, 10, 1)
     screen.blit(f_small.render(
-        "ЛКМ — выбрать · ПКМ — двинуть · SHIFT — все · ПРОБЕЛ — пауза · S — скорость · G — цифры · N — названия · TAB — вкладки · ESC — меню",
+        "Стойки фронтов — вкладка «Войны» · набор — «Обзор» · ПРОБЕЛ — пауза · S — скорость · G — цифры · N — названия · TAB — вкладки · ESC — меню",
         True, MUTED), (card.x + 14, card.y + 9))
     ly = card.y + 36
     x = card.x + 14
@@ -3606,7 +3282,7 @@ def draw_replay_map(screen, game, fonts, snap):
             mp = [(px - MAP_X, py - MAP_Y) for px, py in pts]
             pygame.draw.lines(fx, (10, 11, 15, 200), False, mp, 2)
     screen.blit(fx, (MAP_X, MAP_Y))
-    # столицы-флаги + гарнизоны в тысячах
+    # столицы-флаги
     for r in game.regions:
         x = MAP_X + r.x * TILE
         y = MAP_Y + r.y * TILE
@@ -3614,10 +3290,43 @@ def draw_replay_map(screen, game, fonts, snap):
         if snap["cap"][r.rid] is not None and snap["cap"][r.rid] == owner:
             draw_flag(screen, x + TILE - 26, y + 5, 13,
                       game.factions.get(owner))
-        forces = snap["forces"][r.rid]
-        if forces > 0:
-            rr = counter_rect(f_tiny, x + TILE // 2, y + TILE // 2, forces)
-            draw_counter_rect(screen, f_tiny, rr, faction_color(game, owner), forces)
+    # фронты снимка: плавная линия + числа войск (v3-повторы)
+    if snap.get("fronts"):
+        for (fa, fb, ta, tb) in snap["fronts"]:
+            f_a = game.factions.get(fa)
+            f_b = game.factions.get(fb)
+            col_a = f_a.color if f_a is not None else NEUTRAL_COL
+            col_b = f_b.color if f_b is not None else NEUTRAL_COL
+            line, _push = build_front_line(
+                game, fa, fb, lambda rid: snap["owner"][rid])
+            if len(line) < 2:
+                continue
+            hot = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
+            pts = [(px - MAP_X, py - MAP_Y) for (px, py, _, _, _, _) in line]
+            pygame.draw.lines(hot, (255, 205, 130, 95), False, pts, 3)
+            screen.blit(hot, (MAP_X, MAP_Y))
+            if ta + tb < 400:
+                continue
+            mid = line[len(line) // 2]
+            off = TILE * 0.42
+            img_a = render_outline(f_small, front_troops_text(ta), fill=col_a)
+            img_b = render_outline(f_small, front_troops_text(tb), fill=col_b)
+            pa = (MAP_X + mid[0] + mid[2] * off, MAP_Y + mid[1] + mid[3] * off)
+            pb = (MAP_X + mid[0] - mid[2] * off, MAP_Y + mid[1] - mid[3] * off)
+            screen.blit(img_a, (pa[0] - img_a.get_width() / 2,
+                                pa[1] - img_a.get_height() / 2))
+            screen.blit(img_b, (pb[0] - img_b.get_width() / 2,
+                                pb[1] - img_b.get_height() / 2))
+    # старые повторы (v1): гарнизоны регионов в тысячах
+    if "forces" in snap:
+        for r in game.regions:
+            forces = snap["forces"][r.rid]
+            if forces > 0:
+                x = MAP_X + r.x * TILE
+                y = MAP_Y + r.y * TILE
+                rr = counter_rect(f_tiny, x + TILE // 2, y + TILE // 2, forces)
+                draw_counter_rect(screen, f_tiny, rr,
+                                  faction_color(game, snap["owner"][r.rid]), forces)
     # названия стран на территориях (крупнейший кластер каждой страны)
     if getattr(game, "show_names", True):
         regions_of = {}
@@ -3655,7 +3364,15 @@ def draw_replay_panel(screen, game, fonts, snap):
     total_regs = max(1, n)
     for f in game.factions.values():
         regs = sum(1 for o in snap["owner"] if o == f.fid)
-        tr = int(sum(snap["forces"][i] for i in range(n) if snap["owner"][i] == f.fid))
+        if "fronts" in snap:        # v3: войска на фронтах
+            tr = int(sum(ta if fa == f.fid else tb
+                         for (fa, fb, ta, tb) in snap["fronts"]
+                         if fa == f.fid or fb == f.fid))
+        elif "forces" in snap:      # старый формат повтора (v1)
+            tr = int(sum(snap["forces"][i] for i in range(n)
+                         if snap["owner"][i] == f.fid))
+        else:
+            tr = 0
         stats.append((f, regs, tr))
     stats.sort(key=lambda t: (-t[1], -t[2]))
     y = MAP_Y + 48
@@ -4050,23 +3767,15 @@ def handle_click(game, pos, button):
     r = game.regions[game.selected] if game.selected is not None else None
 
     if game.tab == 1 and r is not None:
-        ay = CONTENT_Y + 162
-        if button == 1 and R(PANEL_X + 10, ay, 292, 42).collidepoint(pos):
-            game.recruit(r.rid)
-            return
-        if button == 1 and R(PANEL_X + 314, ay, 292, 42).collidepoint(pos):
+        if button == 1 and R(PANEL_X + 10, CONTENT_Y + 122,
+                             PANEL_W - 20, 42).collidepoint(pos):
             if r.owner == game.player:
-                game.move_mode = not game.move_mode
-            return
-        if button == 1 and R(PANEL_X + 10, ay + 50, PANEL_W - 20, 42).collidepoint(pos):
-            game.develop_econ(r.rid)
+                game.develop_econ(r.rid)
             return
         for i, n in enumerate(game.neighbors(r)):
-            nr = R(PANEL_X + 10, CONTENT_Y + 292 + i * 36, PANEL_W - 20, 32)
+            nr = R(PANEL_X + 10, CONTENT_Y + 182 + i * 36, PANEL_W - 20, 32)
             if button == 1 and nr.collidepoint(pos):
                 game.selected = n.rid
-                if n.owner != game.player:
-                    game.move_mode = False
                 return
 
     if game.tab == 0:
@@ -4095,7 +3804,11 @@ def handle_click(game, pos, button):
             if button == 1 and br.collidepoint(pos):
                 game.develop_tech(game.player, key)
                 return
-        br2 = R(PANEL_X + 10, yb + 42, PANEL_W - 20, 36)
+        br_res = R(PANEL_X + 10, yb + 40, PANEL_W - 20, 36)
+        if button == 1 and br_res.collidepoint(pos):
+            game.recruit(game.player)
+            return
+        br2 = R(PANEL_X + 10, yb + 80, PANEL_W - 20, 36)
         if button == 1 and br2.collidepoint(pos):
             game.raise_conscript()
             return
@@ -4124,6 +3837,7 @@ def handle_click(game, pos, button):
             y += DIPLO_CARD_H + 8
 
     if game.tab == 3:
+        # сортировки
         sx = PANEL_X + 100
         for key, _ in WAR_SORTS:
             br = R(sx, CONTENT_Y, 118, 24)
@@ -4131,31 +3845,64 @@ def handle_click(game, pos, button):
                 game.war_sort = key
                 return
             sx += 124
+        # строки: доля армии («−»/«+») и стойки (Оборона/Атака)
+        observer = game.player is None
+        y = CONTENT_Y + 32
+        for row in game.war_rows()[:12]:
+            rcol = PANEL_X + PANEL_W - 10
+            fr = row.get("front")
 
-    # карта
+            def hit_alloc():
+                for sgn, bx in ((-1, rcol - 344), (1, rcol - 310)):
+                    if R(bx, y + 16, 28, 26).collidepoint(pos):
+                        return sgn
+                return 0
+
+            def hit_stance():
+                for j, stv in enumerate(("def", "att")):
+                    if R(rcol - 180 + j * 88, y + 14, 82, 30).collidepoint(pos):
+                        return stv
+                return None
+
+            sgn = hit_alloc() if not observer else 0
+            stv = hit_stance() if not observer else None
+            if not sgn and not stv:
+                y += row["h"]
+                continue
+            if row["kind"] == "pre_war" and stv == "att":
+                # атака до войны = объявление войны с атакующей стойкой
+                game.get_front(game.player, row["foe"])
+                if game.declare_war(game.player, row["foe"]):
+                    game.set_stance(game.player, row["foe"], "att",
+                                    fid=game.player)
+                    fr2 = game.war_fronts[game.front_key(game.player,
+                                                         row["foe"])]
+                    fr2.alloc[game.player] = max(fr2.alloc.get(game.player, 0.5),
+                                                 0.7)
+                return
+            if fr is None and (sgn or stv == "def"):
+                fr = game.get_front(game.player, row["foe"]) \
+                    if row["kind"] == "pre_war" else None
+            if fr is None:
+                y += row["h"]
+                continue
+            if sgn:
+                cur = fr.alloc.get(game.player, 0.5)
+                fr.alloc[game.player] = round(
+                    min(1.0, max(0.1, cur + sgn * 0.1)), 2)
+                return
+            if stv:
+                game.set_stance(fr.a, fr.b, stv, fid=game.player)
+                return
+        return
+
+    # карта: просто выбор региона (войска в провинциях не стоят)
     rid = tile_under(game, pos)
     if rid is None:
         return
-    if button == 3:
-        if game.selected is not None and game.selected != rid:
-            src = game.regions[game.selected]
-            dst = game.regions[rid]
-            if dst in game.neighbors(src):
-                frac = 0.95 if (pygame.key.get_mods() & pygame.KMOD_SHIFT) else 0.6
-                game.send_move(src.rid, dst.rid, game.player, frac)
-        return
-    if game.move_mode and game.selected is not None and rid != game.selected:
-        src = game.regions[game.selected]
-        dst = game.regions[rid]
-        if dst in game.neighbors(src) and src.owner == game.player:
-            game.send_move(src.rid, dst.rid, game.player, 0.6)
-            game.move_mode = False
-            return
     game.selected = rid
     if game.regions[rid].owner == game.player:
         game.tab = 1
-    if game.regions[rid].owner != game.player:
-        game.move_mode = False
 
 
 def handle_key(game, key):
@@ -4200,8 +3947,6 @@ def handle_key(game, key):
         game.paused = not game.paused
     elif key == pygame.K_s:
         game.speed_idx = (game.speed_idx + 1) % len(SPEEDS)
-    elif key == pygame.K_m and game.selected is not None:
-        game.move_mode = not game.move_mode
     elif key == pygame.K_g:
         game.show_numbers = not game.show_numbers
     elif key == pygame.K_n:
@@ -4211,8 +3956,6 @@ def handle_key(game, key):
     elif key == pygame.K_ESCAPE:
         if game.on_exit:
             game.exit_requested = True
-        else:
-            game.move_mode = False
 
 
 # ============================ ЗАПУСК ============================

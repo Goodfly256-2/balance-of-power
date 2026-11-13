@@ -22,40 +22,44 @@ The game generates its music and loading screens on first launch.
 
 ## Features
 
-- **Regions and fronts**: armies are garrisons inside provinces — recruit,
-  develop, march between regions, intercept enemies on the march and fight
-  for regions; front troop counts along the border — **front numbers appear
-  only for nations actually at war**.
-- **Liquid capture view**: the capture border is an organic "liquid" line
-  with smooth rounded lobes — the attacker's color flows across the
-  territory like ink and seamlessly joins across staircase fronts.
+- **Front-based warfare (v2.4)**: wars are fronts, not province battles.
+  Troops live only in the reserve or on a front; a front is a smooth line
+  along the actual territory border (flat at the start), fully independent
+  of provinces.
+- **Stances per front**: Defense or Attack (Wars tab); "Attack" on a peaceful
+  border declares war; borders can be guarded before the war starts.
+- **Mini-attacks**: the front is split into sections; an attack picks a
+  random section and depth, and territory changes hands only with a solid
+  superiority (tech, numbers, doctrines, morale). Both sides take losses;
+  a failed attack pushes the line back.
+- **Troop distribution**: "−/＋" sets each front's share of the army, the
+  rest stays in reserve; several mini-attacks can run in different places
+  at once (depends on tactics and doctrine).
 - **Scenarios**: Classic, Giant Duel, Six Powers, Besieged Citadel,
   The Divide, Anarchy (8 nations on 10×10).
-- **Doctrines**: Maneuver / Strike / Defense — a counter-triangle
-  (Maneuver beats Strike, Strike breaks Defense, Defense grinds Maneuver).
+- **Doctrines**: Maneuver / Strike / Defense — a counter-triangle.
 - **Technology**: Artillery, Communications, Motorized Infantry, Medicine.
 - **Ideologies**: Democracy, Monarchy, Fascism, Communism, Technocracy —
   each changes economy, army and behavior; procedural nation flags.
-- **Diplomacy**: alliances with mandatory war debt (attacking an ally drags
-  in its partners), pacts, trade, ally aid (Gold and Manpower), AI betrayals.
+- **Diplomacy**: alliances with mandatory war debt, pacts, trade, ally aid,
+  AI betrayals, peace offers.
 - **Replays**: auto-save finished games, watch them from the main menu,
   territory-over-time chart.
-- **Misc**: main menu with update check, loading screens with procedural
-  landscapes, resizable window and fullscreen (F11), generated music
-  (menu and in-game), observer mode.
+- **Misc**: main menu with update check, procedural loading screens,
+  resizable window and fullscreen (F11), generated music, observer mode.
 - **Support the dev**: built-in donate tab — USDT / USDC / POL on Polygon.
 
 ## Controls
 
 | Key | Action |
 |-----|--------|
-| LMB / RMB | select region / send troops |
-| SHIFT + RMB | send almost all troops |
+| LMB | select province / press buttons |
+| TAB | panel tabs (Overview / Region / Diplomacy / Wars) |
+| Wars tab | front stances (Defense/Attack), army distribution "−/＋" |
+| Overview tab | recruit to reserve, doctrines, technologies |
 | SPACE | pause |
 | S | speed ×1 → ×2 → ×4 → ×8 |
-| G | show all troop numbers |
 | N | nation names on the map |
-| TAB | panel tabs (Overview / Region / Diplomacy / Wars) |
 | F11 | fullscreen |
 | ESC | back to main menu |
 
